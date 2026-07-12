@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+import os
+import sys
+import re
+import argparse
+import subprocess
+import atexit
+from pathlib import Path
+import httpx
+from openai import OpenAI
+from rich.console import Console
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.live import Live
+from rich.table import Table
+from rich.markdown import Markdown
+from rich.prompt import Prompt
+from rich.align import Align
+
+console = Console()
+
+MODELS_PRESETS = {
+    "1": {
+        "name": "Llama 3.1 8B Instruct",
+        "repo": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+        "quants": {
+            "Q4_K_M": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+            "Q5_K_M": "Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf",
+            "Q8_0": "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf"
+        }
+    },
+    "2": {
+        "name": "Qwen 2.5 7B Instruct",
+        "repo": "Qwen/Qwen2.5-7B-Instruct-GGUF",
+        "quants": {
+            "Q4_K_M": "qwen2.5-7b-instruct-q4_k_m.gguf",
+            "Q5_K_M": "qwen2.5-7b-instruct-q5_k_m.gguf",
+            "Q8_0": "qwen2.5-7b-instruct-q8_0.gguf"
+        }
+    },
+    "3": {
+        "name": "Mistral 7B Instruct v0.3",
+        "repo": "MaziyarPanahi/Mistral-7B-Instruct-v0.3-GGUF",
+        "quants": {
+            "Q4_K_M": "Mistral-7B-Instruct-v0.3.Q4_K_M.gguf",
+            "Q5_K_M": "Mistral-7B-Instruct-v0.3.Q5_K_M.gguf",
+            "Q8_0": "Mistral-7B-Instruct-v0.3.Q8_0.gguf"
+        }
+    },
+    "4": {
+        "name": "Phi-3.5 Mini Instruct (3.8B)",
+        "repo": "bartowski/Phi-3.5-mini-instruct-GGUF",
+        "quants": {
+            "Q4_K_M": "Phi-3.5-mini-instruct-Q4_K_M.gguf",
+            "Q5_K_M": "Phi-3.5-mini-instruct-Q5_K_M.gguf",
+            "Q8_0": "Phi-3.5-mini-instruct-Q8_0.gguf"
+        }
+    }
+}
+
+def get_models_dir() -> Path:
+    if getattr(sys, 'frozen', False):
+        m_dir = Path(sys.executable).parent / "models"
+    else:
+        m_dir = Path(__file__).parent / "models"
+    m_dir.mkdir(parents=True, exist_ok=True)
+    return m_dir
+
+def get_safe_path(target_dir: Path, subpath_str: str) -> Path:
+    """Resolve subpath safely, ensuring it is within the target directory."""
+    target_dir = target_dir.resolve()
+    subpath_str = subpath_str.strip()
+    if subpath_str.startswith("/") or Path(subpath_str).is_absolute():
+        raise ValueError(f"Security error: Absolute path '{subpath_str}' is not allowed.")
+    
+    resolved = (target_dir / subpath_str).resolve()
+    if not resolved.is_relative_to(target_dir):
+        raise ValueError(f"Security error: Path '{subpath_str}' escapes target directory '{target_dir}'")
+    return resolved
+
+def tool_list_dir(target_dir: Path, path: str) -> str:
+    try:
+        target_dir = target_dir.resolve()
+        safe_path = get_safe_path(target_dir, path)
+        if not safe_path.exists():
+            return f"Error: Path '{path}' does not exist."
+        if not safe_path.is_dir():
+            return f"Error: Path '{path}' is a file, not a directory."
+        
+        entries = []
+        for entry in safe_path.iterdir():
+            rel_path = entry.relative_to(target_dir)
+            prefix = "[DIR] " if entry.is_dir() else "[FILE]"
+            entries.append(f"{prefix} {rel_path}")
+        
+        if not entries:
+            return "Directory is empty."
+        return "\n".join(sorted(entries))
+    except Exception as e:
+        return f"Error listing directory: {str(e)}"
+
+def tool_read_file(target_dir: Path, path: str) -> str:
+    try:
+        target_dir = target_dir.resolve()
+        safe_path = get_safe_path(target_dir, path)
+        if not safe_path.exists():
+            return f"Error: File '{path}' does not exist."
+        if not safe_path.is_file():
+            return f"Error: Path '{path}' is not a file."
+        return safe_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Error reading file: {str(e)}"
+
+def tool_write_file(target_dir: Path, path: str, content: str) -> str:
+    try:
+        target_dir = target_dir.resolve()
+        safe_path = get_safe_path(target_dir, path)
+        safe_path.parent.mkdir(parents=True, exist_ok=True)
+        safe_path.write_text(content, encoding="utf-8")
+        return f"Successfully wrote {len(content)} bytes to '{path}'."
+    except Exception as e:
+        return f"Error writing file: {str(e)}"
+
+def tool_patch_file(target_dir: Path, path: str, search: str, replace: str) -> str:
+    try:
+        target_dir = target_dir.resolve()
+        safe_path = get_safe_path(target_dir, path)
+        if not safe_path.exists():
+            return f"Error: File '{path}' does not exist."
+        
+        original_content = safe_path.read_text(encoding="utf-8")
+        
+        if search in original_content:
+            new_content = original_content.replace(search, replace, 1)
+            safe_path.write_text(new_content, encoding="utf-8")
+            return f"Successfully applied patch to '{path}'."
+        
+        normalized_search = search.replace("\r\n", "\n").strip()
+        normalized_original = original_content.replace("\r\n", "\n")
+        
+        if normalized_search in normalized_original:
+            new_content = normalized_original.replace(normalized_search, replace.replace("\r\n", "\n"), 1)
+            safe_path.write_text(new_content, encoding="utf-8")
+            return f"Successfully applied patch (normalized whitespace) to '{path}'."
+            
+        return f"Error: Could not find exact search block in '{path}'. Please ensure the search block is identical, including indentation."
+    except Exception as e:
+        return f"Error patching file: {str(e)}"
+
+def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
+    """Print the tool execution beautifully in the console."""
+    console.print(Panel(f"[bold yellow]Executed Tool:[/bold yellow] [cyan]{tool_name}[/cyan]\n[bold]Arguments:[/bold] {args_info}", border_style="yellow", title="Tool Invocation"))
+    
+    if tool_name == "list_dir":
+        table = Table(title=f"Files in target directory", show_header=True, header_style="bold magenta")
+        table.add_column("Type", style="dim", width=8)
+        table.add_column("Path", style="blue")
+        for line in result.splitlines():
+            if line.startswith("[DIR]"):
+                table.add_row("DIR", line.replace("[DIR] ", ""))
+            elif line.startswith("[FILE]"):
+                table.add_row("FILE", line.replace("[FILE] ", ""))
+            else:
+                table.add_row("", line)
+        console.print(table)
+    elif tool_name in ["read_file", "write_file"]:
+        lexer = "python"
+        if args_info.endswith(".json"): lexer = "json"
+        elif args_info.endswith(".md"): lexer = "markdown"
+        elif args_info.endswith(".html"): lexer = "html"
+        elif args_info.endswith(".css"): lexer = "css"
+        elif args_info.endswith(".js"): lexer = "javascript"
+        
+        lines = result.splitlines()
+        preview_limit = 35
+        if len(lines) > preview_limit:
+            preview_content = "\n".join(lines[:preview_limit]) + f"\n... [dim]({len(lines) - preview_limit} lines hidden)[/dim]"
+        else:
+            preview_content = result
+            
+        console.print(Panel(Syntax(preview_content, lexer, theme="monokai", line_numbers=True), title=f"File Content: {args_info}", border_style="green"))
+    else:
+        console.print(Panel(result, border_style="cyan", title="Tool Result"))
+
+def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
+    """Parse XML tags in response and execute tools in the order they appear."""
+    matches = []
+    
+    for m in re.finditer(r"<list_dir>(.*?)</list_dir>", text, re.DOTALL):
+        matches.append((m.start(), "list_dir", m))
+        
+    for m in re.finditer(r"<read_file>(.*?)</read_file>", text, re.DOTALL):
+        matches.append((m.start(), "read_file", m))
+        
+    for m in re.finditer(r"<write_file\s+path=([\"']?)(.*?)\1>(.*?)</write_file>", text, re.DOTALL):
+        matches.append((m.start(), "write_file", m))
+        
+    for m in re.finditer(r"<patch_file\s+path=([\"']?)(.*?)\1>\s*<search>(.*?)</search>\s*<replace>(.*?)</replace>\s*</patch_file>", text, re.DOTALL):
+        matches.append((m.start(), "patch_file", m))
+        
+    matches.sort(key=lambda x: x[0])
+    
+    results = []
+    for _, tag_type, m in matches:
+        if tag_type == "list_dir":
+            path = m.group(1).strip()
+            res = tool_list_dir(target_dir, path)
+            format_and_print_tool_call("list_dir", path, res)
+            results.append({"tool": "list_dir", "path": path, "result": res})
+            
+        elif tag_type == "read_file":
+            path = m.group(1).strip()
+            res = tool_read_file(target_dir, path)
+            format_and_print_tool_call("read_file", path, res)
+            results.append({"tool": "read_file", "path": path, "result": res})
+            
+        elif tag_type == "write_file":
+            path = m.group(2).strip()
+            content = m.group(3)
+            if content.startswith("\n"):
+                content = content[1:]
+            res = tool_write_file(target_dir, path, content)
+            format_and_print_tool_call("write_file", path, res)
+            results.append({"tool": "write_file", "path": path, "result": res})
+            
+        elif tag_type == "patch_file":
+            path = m.group(2).strip()
+            search = m.group(3)
+            replace = m.group(4)
+            if search.startswith("\n"):
+                search = search[1:]
+            if replace.startswith("\n"):
+                replace = replace[1:]
+            res = tool_patch_file(target_dir, path, search, replace)
+            format_and_print_tool_call("patch_file", path, res)
+            results.append({"tool": "patch_file", "path": path, "result": res})
+            
+    return results
+
+def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int):
+    """Executes the agentic reasoning & execution loop with live updates."""
+    for i in range(1, max_iterations + 1):
+        console.print(f"\n[bold blue]🤖 Agent Thinking (Step {i}/{max_iterations}) ...[/bold blue]")
+        
+        assistant_response = ""
+        try:
+            with Live(console=console, refresh_per_second=8) as live:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.2,
+                    stream=True
+                )
+                for chunk in response:
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        assistant_response += content
+                        live.update(Panel(Markdown(assistant_response), title=f"[bold green]Assistant (Step {i})[/bold green]", border_style="blue"))
+        except KeyboardInterrupt:
+            console.print("\n[bold yellow]Generation interrupted by user.[/bold yellow]")
+            if not assistant_response:
+                break
+        except Exception as e:
+            console.print(f"[bold red]API call failed:[/bold red] {e}")
+            break
+            
+        if not assistant_response:
+            console.print("[bold red]Received empty response from the model.[/bold red]")
+            break
+            
+        messages.append({"role": "assistant", "content": assistant_response})
+        
+        tool_results = parse_and_execute_tools(target_dir, assistant_response)
+        
+        if not tool_results:
+            console.print("[bold green]✔ No tools triggered or task complete.[/bold green]")
+            break
+            
+        result_message_parts = []
+        for tr in tool_results:
+            result_message_parts.append(
+                f"### Execution result of {tr['tool']} on '{tr['path']}':\n{tr['result']}\n"
+            )
+        
+        result_message = "\n".join(result_message_parts)
+        console.print(f"[bold cyan]Sending tool results back to LLM...[/bold cyan]")
+        messages.append({"role": "user", "content": result_message})
+        
+    return messages
+
+def run_single_prompt(client: OpenAI, model: str, messages: list[dict]):
+    console.print(f"[bold blue]Sending prompt to LLM...[/bold blue]")
+    assistant_response = ""
+    try:
+        with Live(console=console, refresh_per_second=8) as live:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.2,
+                stream=True
+            )
+            for chunk in response:
+                content = chunk.choices[0].delta.content
+                if content:
+                    assistant_response += content
+                    live.update(Panel(Markdown(assistant_response), title="Assistant Response", border_style="blue"))
+        messages.append({"role": "assistant", "content": assistant_response})
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]Generation interrupted by user.[/bold yellow]")
+        if assistant_response:
+            messages.append({"role": "assistant", "content": assistant_response})
+    except Exception as e:
+        console.print(f"[bold red]API call failed:[/bold red] {e}")
+    return messages
+
+def detect_provider():
+    """Detects active local provider: LM Studio or llama.cpp."""
+    try:
+        with httpx.Client(timeout=1.0) as http_client:
+            res = http_client.get("http://localhost:1234/v1/models")
+            if res.status_code == 200:
+                return "lmstudio", "http://localhost:1234/v1"
+    except Exception:
+        pass
+        
+    try:
+        with httpx.Client(timeout=1.0) as http_client:
+            res = http_client.get("http://localhost:8080/v1/models")
+            if res.status_code == 200:
+                return "llamacpp", "http://localhost:8080/v1"
+    except Exception:
+        pass
+        
+    return None, None
+
+def download_huggingface_model():
+    """Interactively select and download a model from Hugging Face."""
+    table = Table(title="Available Hugging Face Presets (<=8B)", show_header=True, header_style="bold green")
+    table.add_column("Index", style="cyan", justify="center")
+    table.add_column("Model Name", style="magenta")
+    table.add_column("Hugging Face Repository")
+    
+    for idx, data in MODELS_PRESETS.items():
+        table.add_row(idx, data["name"], data["repo"])
+    console.print(table)
+    
+    selection = Prompt.ask("Select model index to download", choices=list(MODELS_PRESETS.keys()) + ["exit"])
+    if selection == "exit":
+        return
+        
+    model_data = MODELS_PRESETS[selection]
+    quant_choices = list(model_data["quants"].keys())
+    quant_selection = Prompt.ask(f"Select quantization level for {model_data['name']}", choices=quant_choices + ["exit"])
+    if quant_selection == "exit":
+        return
+        
+    filename = model_data["quants"][quant_selection]
+    repo_id = model_data["repo"]
+    destination_file = get_models_dir() / filename
+    
+    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+    
+    from rich.progress import Progress, TextColumn, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn
+    
+    console.print(f"\n[cyan]Starting download from Hugging Face:[/cyan] {url}")
+    try:
+        with httpx.stream("GET", url, follow_redirects=True) as response:
+            if response.status_code != 200:
+                console.print(f"[bold red]HTTP error {response.status_code}: Model file not found on HF.[/bold red]")
+                return
+                
+            total_size = int(response.headers.get("content-length", 0))
+            
+            with Progress(
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                DownloadColumn(),
+                TransferSpeedColumn(),
+                TimeRemainingColumn(),
+                console=console
+            ) as progress:
+                task = progress.add_task(f"Downloading {filename}", total=total_size)
+                
+                with open(destination_file, "wb") as f:
+                    for chunk in response.iter_bytes(chunk_size=8192):
+                        f.write(chunk)
+                        progress.update(task, advance=len(chunk))
+                        
+        console.print(f"[bold green]✔ Model downloaded successfully and saved to: {destination_file}[/bold green]")
+    except Exception as e:
+        console.print(f"[bold red]Download failed: {e}[/bold red]")
+
+def list_downloaded_models():
+    """List GGUF files in the models directory."""
+    models_dir = get_models_dir()
+    gguf_files = list(models_dir.glob("*.gguf"))
+    
+    table = Table(title=f"Local GGUF Models ({models_dir})", show_header=True, header_style="bold magenta")
+    table.add_column("Filename", style="blue")
+    table.add_column("Size", style="green", justify="right")
+    
+    for f in gguf_files:
+        size_mb = f.stat().st_size / (1024 * 1024)
+        table.add_row(f.name, f"{size_mb:.1f} MB")
+        
+    if not gguf_files:
+        table.add_row("No GGUF models found.", "")
+        
+    console.print(table)
+    return gguf_files
+
+def serve_local_model():
+    """Launch llama-server with one of the downloaded GGUF models."""
+    gguf_files = list_downloaded_models()
+    if not gguf_files:
+        console.print("[yellow]Please download a model first using the [bold]/models[/bold] option.[/yellow]")
+        return
+        
+    choices = [str(i) for i in range(1, len(gguf_files) + 1)]
+    for idx, f in enumerate(gguf_files, 1):
+        console.print(f"[{idx}] {f.name}")
+        
+    selection = Prompt.ask("Select model index to serve", choices=choices + ["exit"])
+    if selection == "exit":
+        return
+        
+    selected_file = gguf_files[int(selection) - 1]
+    port = Prompt.ask("Choose port to run llama-server on", default="8080")
+    
+    # Construct llama-server command
+    cmd = ["llama-server", "-m", str(selected_file), "--port", port, "-c", "4096"]
+    
+    console.print(f"[cyan]Attempting to start local llama-server...[/cyan]")
+    console.print(f"[dim]Running command: {' '.join(cmd)}[/dim]")
+    
+    try:
+        # Launch llama-server in the background as a subprocess
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        atexit.register(lambda: proc.terminate())
+        console.print(f"[bold green]✔ Server launched in background with PID {proc.pid}![/bold green]")
+        console.print(f"[green]You can now connect the CLI to this server using --provider llamacpp --port {port}[/green]")
+    except FileNotFoundError:
+        console.print("[bold red]Error: 'llama-server' binary not found in your system PATH.[/bold red]")
+        console.print("[yellow]Make sure you have llama.cpp installed and llama-server added to your system PATH.[/yellow]")
+        console.print(f"[yellow]Alternatively, run it manually in a separate shell:[/yellow]\n  [bold]llama-server -m {selected_file} --port {port} -c 4096[/bold]")
+    except Exception as e:
+        console.print(f"[bold red]Failed to start server subprocess: {e}[/bold red]")
+
+def print_help_repl():
+    table = Table(title="Available Interactive Commands", show_header=True, header_style="bold green")
+    table.add_column("Command", style="cyan")
+    table.add_column("Description")
+    table.add_row("/help", "Show this help screen")
+    table.add_row("/models", "Manage (list & download) local GGUF models")
+    table.add_row("/serve", "Serve a downloaded model using llama-server")
+    table.add_row("/system", "Print the active system prompt")
+    table.add_row("/provider", "Display current provider and connection settings")
+    table.add_row("/dir", "List files in the target directory")
+    table.add_row("/clear", "Clear history or screen")
+    table.add_row("/exit or /quit", "Exit the interactive session")
+    console.print(table)
+
+def main():
+    parser = argparse.ArgumentParser(description="Local Coder - Beautiful CLI coding agent.")
+    parser.add_argument("--provider", choices=["lmstudio", "llamacpp", "custom"], help="Choose the preset local LLM provider")
+    parser.add_argument("--api-url", help="OpenAI-compatible local API base URL (overrides provider default)")
+    parser.add_argument("--api-key", help="API key to use")
+    parser.add_argument("--model", help="Model identifier to specify in the API calls")
+    parser.add_argument("--target-dir", default=".", help="Target folder for file operations (default: current directory)")
+    parser.add_argument("--system-prompt", help="Path to custom system prompt txt file")
+    parser.add_argument("--agent", action="store_true", help="Enable autonomous agent loop with filesystem tools")
+    parser.add_argument("--max-iterations", type=int, default=10, help="Maximum number of loop iterations for agent mode")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Force launch the interactive REPL shell")
+    parser.add_argument("prompt", nargs="?", help="The programming task / instruction for the LLM")
+    
+    args = parser.parse_args()
+    
+    api_url = args.api_url
+    api_key = args.api_key
+    model = args.model
+    provider = args.provider
+    
+    if not provider and not api_url:
+        detected_prov, detected_url = detect_provider()
+        if detected_prov:
+            provider = detected_prov
+            api_url = detected_url
+            console.print(f"[bold green]✔ Auto-detected active provider: [yellow]{provider}[/yellow] at {api_url}[/bold green]")
+        else:
+            provider = "lmstudio"
+            console.print("[yellow]⚠ No active provider detected on default ports. Defaulting to LM Studio preset.[/yellow]")
+            
+    if provider == "lmstudio":
+        if not api_url: api_url = "http://localhost:1234/v1"
+        if not api_key: api_key = "lm-studio"
+        if not model: model = "local-model"
+    elif provider == "llamacpp":
+        if not api_url: api_url = "http://localhost:8080/v1"
+        if not api_key: api_key = "not-needed"
+        if not model: model = "local-model"
+    else:
+        if not api_url: api_url = "http://localhost:1234/v1"
+        if not api_key: api_key = "lm-studio"
+        if not model: model = "local-model"
+
+    target_dir = Path(args.target_dir).resolve()
+    if not target_dir.exists():
+        console.print(f"[bold yellow]Target directory '{target_dir}' does not exist. Creating it...[/bold yellow]")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        
+    system_prompt_content = ""
+    if args.system_prompt:
+        sys_prompt_path = Path(args.system_prompt)
+        if sys_prompt_path.exists():
+            system_prompt_content = sys_prompt_path.read_text(encoding="utf-8")
+        else:
+            console.print(f"[bold red]System prompt file not found at {args.system_prompt}[/bold red]")
+            sys.exit(1)
+    else:
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            default_path = Path(sys._MEIPASS) / "system_prompt.txt"
+        else:
+            default_path = Path(__file__).parent / "system_prompt.txt"
+            
+        if default_path.exists():
+            system_prompt_content = default_path.read_text(encoding="utf-8")
+        else:
+            system_prompt_content = "You are a helpful coding assistant. You have local file system access."
+
+    client = OpenAI(base_url=api_url, api_key=api_key)
+    
+    messages = [{"role": "system", "content": system_prompt_content}]
+    
+    is_interactive = args.interactive or (not args.prompt)
+    
+    if is_interactive:
+        console.print(Panel(
+            Align.center(f"[bold cyan]Local Coder CLI REPL[/bold cyan]\n"
+                         f"Target: [green]{target_dir}[/green] | Provider: [yellow]{provider}[/yellow] | Model: [blue]{model}[/blue]\n"
+                         f"Type [yellow]/help[/yellow] for commands, [yellow]/exit[/yellow] to quit."),
+            border_style="magenta",
+            title="Interactive Session"
+        ))
+        
+        while True:
+            try:
+                user_input = Prompt.ask("[bold green]Local Coder[/bold green]")
+                user_input = user_input.strip()
+                if not user_input:
+                    continue
+                
+                if user_input.startswith("/"):
+                    cmd = user_input.lower().split()[0]
+                    if cmd in ["/exit", "/quit"]:
+                        console.print("[bold red]Exiting interactive session.[/bold red]")
+                        break
+                    elif cmd == "/help":
+                        print_help_repl()
+                        continue
+                    elif cmd == "/system":
+                        console.print(Panel(system_prompt_content, title="Active System Prompt", border_style="yellow"))
+                        continue
+                    elif cmd == "/provider":
+                        console.print(Panel(f"Provider: {provider}\nBase URL: {api_url}\nModel: {model}\nAPI Key: {api_key}", title="Connection Settings", border_style="yellow"))
+                        continue
+                    elif cmd == "/dir":
+                        res = tool_list_dir(target_dir, ".")
+                        format_and_print_tool_call("list_dir", ".", res)
+                        continue
+                    elif cmd == "/clear":
+                        messages = [{"role": "system", "content": system_prompt_content}]
+                        os.system('cls' if os.name == 'nt' else 'clear')
+                        console.print("[green]Session history and screen cleared.[/green]")
+                        continue
+                    elif cmd == "/models":
+                        list_downloaded_models()
+                        action = Prompt.ask("Do you want to download a new model?", choices=["yes", "no"], default="no")
+                        if action == "yes":
+                            download_huggingface_model()
+                        continue
+                    elif cmd == "/serve":
+                        serve_local_model()
+                        continue
+                    else:
+                        console.print(f"[bold red]Unknown command {cmd}. Type /help for assistance.[/bold red]")
+                        continue
+                
+                messages.append({"role": "user", "content": user_input})
+                if args.agent:
+                    messages = run_agent_loop(client, model, target_dir, messages, args.max_iterations)
+                else:
+                    messages = run_single_prompt(client, model, messages)
+                    
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[bold red]Session interrupted. Exiting.[/bold red]")
+                break
+    else:
+        messages.append({"role": "user", "content": args.prompt})
+        console.print(Panel(f"[bold green]Target Directory:[/bold green] {target_dir.resolve()}\n[bold green]Provider:[/bold green] {provider} ({api_url})\n[bold green]Task:[/bold green] {args.prompt}", title="Agent Run Started"))
+        if args.agent:
+            run_agent_loop(client, model, target_dir, messages, args.max_iterations)
+        else:
+            run_single_prompt(client, model, messages)
+
+if __name__ == "__main__":
+    main()
