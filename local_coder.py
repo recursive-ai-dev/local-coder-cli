@@ -17,7 +17,14 @@ from rich.markdown import Markdown
 from rich.prompt import Prompt
 from rich.align import Align
 
+from textual.app import App, ComposeResult
+from textual.containers import VerticalScroll
+from textual.widgets import Header, Footer, Static, Input
+from textual import work
+
+
 console = Console()
+TUI_MODE = False
 
 MODELS_PRESETS = {
     "1": {
@@ -148,6 +155,7 @@ def tool_patch_file(target_dir: Path, path: str, search: str, replace: str) -> s
         return f"Error patching file: {str(e)}"
 
 def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
+    if TUI_MODE: return
     """Print the tool execution beautifully in the console."""
     console.print(Panel(f"[bold yellow]Executed Tool:[/bold yellow] [cyan]{tool_name}[/cyan]\n[bold]Arguments:[/bold] {args_info}", border_style="yellow", title="Tool Invocation"))
     
@@ -465,6 +473,208 @@ def print_help_repl():
     table.add_row("/exit or /quit", "Exit the interactive session")
     console.print(table)
 
+
+class ChatMessage(Static):
+    def __init__(self, text: str, role: str):
+        super().__init__()
+        self.text = text
+        self.role = role
+
+    def render(self):
+        if self.role == "user":
+            return Align.right(Panel(self.text, title="You", border_style="green", expand=False))
+        elif self.role == "assistant":
+            return Panel(Markdown(self.text), title="Assistant", border_style="blue", expand=False)
+        else: # System or tool
+            return Panel(self.text, title=self.role.capitalize(), border_style="yellow", expand=False)
+
+class LocalCoderApp(App):
+    CSS = """
+    Screen {
+        layout: vertical;
+    }
+    #chat-history {
+        height: 1fr;
+        padding: 0 1;
+    }
+    #input-box {
+        dock: bottom;
+        height: 3;
+    }
+    """
+    
+    def __init__(self, client, model, target_dir, messages, agent_mode, max_iterations):
+        super().__init__()
+        self.client = client
+        self.model = model
+        self.target_dir = target_dir
+        self.messages = messages
+        self.agent_mode = agent_mode
+        self.max_iterations = max_iterations
+        self.is_processing = False
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield VerticalScroll(id="chat-history")
+        yield Input(placeholder="Type your instruction... (or /help)", id="input-box")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.chat_history = self.query_one("#chat-history")
+        self.input_box = self.query_one("#input-box")
+        self.title = "Local Coder TUI"
+        self.sub_title = f"Model: {self.model} | Target: {self.target_dir}"
+        
+        # Display welcome message
+        self.chat_history.mount(ChatMessage("Welcome to Local Coder! Type your instruction below.", "system"))
+
+    async def on_input_submitted(self, message: Input.Submitted) -> None:
+        if self.is_processing:
+            return
+            
+        user_input = message.value.strip()
+        if not user_input:
+            return
+            
+        self.input_box.value = ""
+        
+        if user_input.startswith("/"):
+            await self.handle_slash_command(user_input)
+            return
+
+        self.messages.append({"role": "user", "content": user_input})
+        await self.chat_history.mount(ChatMessage(user_input, "user"))
+        self.chat_history.scroll_end(animate=False)
+        
+        if self.agent_mode:
+            self.run_agent_loop_async()
+        else:
+            self.run_single_prompt_async()
+
+    async def handle_slash_command(self, cmd_line: str):
+        cmd = cmd_line.lower().split()[0]
+        if cmd in ["/exit", "/quit"]:
+            self.exit()
+        elif cmd == "/dir":
+            res = tool_list_dir(self.target_dir, ".")
+            await self.chat_history.mount(ChatMessage(res, "system"))
+            self.chat_history.scroll_end(animate=False)
+        elif cmd == "/clear":
+            # Just clear UI history
+            for child in self.chat_history.children:
+                child.remove()
+            # Retain system prompt
+            sys_prompt = self.messages[0]
+            self.messages = [sys_prompt]
+            await self.chat_history.mount(ChatMessage("History cleared.", "system"))
+        else:
+            await self.chat_history.mount(ChatMessage(f"Command {cmd} not supported in TUI yet. Supported: /exit, /clear, /dir", "system"))
+            self.chat_history.scroll_end(animate=False)
+
+    @work(thread=True)
+    def run_single_prompt_async(self):
+        self.is_processing = True
+        self.call_from_thread(self.input_box.set_class, True, "-disabled") # just logic
+        
+        assistant_response = ""
+        try:
+            # We must mount a ChatMessage first to stream into it.
+            # But ChatMessage relies on self.text, we need a way to update it.
+            
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=self.messages,
+                temperature=0.2,
+                stream=True
+            )
+            
+            # Since updating UI from thread requires call_from_thread, and we want live streaming:
+            # We can create a widget and update its text.
+            class StreamMessage(Static):
+                def __init__(self):
+                    super().__init__("")
+                    self.content = ""
+                def update_content(self, chunk):
+                    self.content += chunk
+                    self.update(Panel(Markdown(self.content), title="Assistant", border_style="blue", expand=False))
+                    
+            stream_msg = StreamMessage()
+            self.call_from_thread(self.chat_history.mount, stream_msg)
+            
+            for chunk in response:
+                content = chunk.choices[0].delta.content
+                if content:
+                    assistant_response += content
+                    self.call_from_thread(stream_msg.update_content, content)
+                    self.call_from_thread(self.chat_history.scroll_end, animate=False)
+                    
+            self.messages.append({"role": "assistant", "content": assistant_response})
+            
+        except Exception as e:
+            self.call_from_thread(self.chat_history.mount, ChatMessage(f"Error: {e}", "system"))
+        finally:
+            self.is_processing = False
+
+    @work(thread=True)
+    def run_agent_loop_async(self):
+        self.is_processing = True
+        try:
+            for i in range(1, self.max_iterations + 1):
+                self.call_from_thread(self.chat_history.mount, ChatMessage(f"🤖 Agent Thinking (Step {i}/{self.max_iterations}) ...", "system"))
+                self.call_from_thread(self.chat_history.scroll_end, animate=False)
+                
+                assistant_response = ""
+                class StreamMessage(Static):
+                    def __init__(self):
+                        super().__init__("")
+                        self.content = ""
+                    def update_content(self, chunk):
+                        self.content += chunk
+                        self.update(Panel(Markdown(self.content), title=f"Assistant (Step {i})", border_style="blue", expand=False))
+                        
+                stream_msg = StreamMessage()
+                self.call_from_thread(self.chat_history.mount, stream_msg)
+                
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=self.messages,
+                    temperature=0.2,
+                    stream=True
+                )
+                
+                for chunk in response:
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        assistant_response += content
+                        self.call_from_thread(stream_msg.update_content, content)
+                        self.call_from_thread(self.chat_history.scroll_end, animate=False)
+                        
+                self.messages.append({"role": "assistant", "content": assistant_response})
+                
+                # Execute tools
+                tool_results = parse_and_execute_tools(self.target_dir, assistant_response)
+                
+                if not tool_results:
+                    self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))
+                    self.call_from_thread(self.chat_history.scroll_end, animate=False)
+                    break
+                    
+                result_message_parts = []
+                for tr in tool_results:
+                    result_message_parts.append(f"### Execution result of {tr['tool']} on '{tr['path']}':\n{tr['result']}\n")
+                    # Show tool result in UI
+                    self.call_from_thread(self.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr['path']}:\n{tr['result']}", "system"))
+                    
+                result_message = "\n".join(result_message_parts)
+                self.messages.append({"role": "user", "content": result_message})
+                self.call_from_thread(self.chat_history.scroll_end, animate=False)
+                
+        except Exception as e:
+            self.call_from_thread(self.chat_history.mount, ChatMessage(f"Error: {e}", "system"))
+        finally:
+            self.is_processing = False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Local Coder - Beautiful CLI coding agent.")
     parser.add_argument("--provider", choices=["lmstudio", "llamacpp", "custom"], help="Choose the preset local LLM provider")
@@ -538,67 +748,12 @@ def main():
     
     is_interactive = args.interactive or (not args.prompt)
     
+
     if is_interactive:
-        console.print(Panel(
-            Align.center(f"[bold cyan]Local Coder CLI REPL[/bold cyan]\n"
-                         f"Target: [green]{target_dir}[/green] | Provider: [yellow]{provider}[/yellow] | Model: [blue]{model}[/blue]\n"
-                         f"Type [yellow]/help[/yellow] for commands, [yellow]/exit[/yellow] to quit."),
-            border_style="magenta",
-            title="Interactive Session"
-        ))
-        
-        while True:
-            try:
-                user_input = Prompt.ask("[bold green]Local Coder[/bold green]")
-                user_input = user_input.strip()
-                if not user_input:
-                    continue
-                
-                if user_input.startswith("/"):
-                    cmd = user_input.lower().split()[0]
-                    if cmd in ["/exit", "/quit"]:
-                        console.print("[bold red]Exiting interactive session.[/bold red]")
-                        break
-                    elif cmd == "/help":
-                        print_help_repl()
-                        continue
-                    elif cmd == "/system":
-                        console.print(Panel(system_prompt_content, title="Active System Prompt", border_style="yellow"))
-                        continue
-                    elif cmd == "/provider":
-                        console.print(Panel(f"Provider: {provider}\nBase URL: {api_url}\nModel: {model}\nAPI Key: {api_key}", title="Connection Settings", border_style="yellow"))
-                        continue
-                    elif cmd == "/dir":
-                        res = tool_list_dir(target_dir, ".")
-                        format_and_print_tool_call("list_dir", ".", res)
-                        continue
-                    elif cmd == "/clear":
-                        messages = [{"role": "system", "content": system_prompt_content}]
-                        os.system('cls' if os.name == 'nt' else 'clear')
-                        console.print("[green]Session history and screen cleared.[/green]")
-                        continue
-                    elif cmd == "/models":
-                        list_downloaded_models()
-                        action = Prompt.ask("Do you want to download a new model?", choices=["yes", "no"], default="no")
-                        if action == "yes":
-                            download_huggingface_model()
-                        continue
-                    elif cmd == "/serve":
-                        serve_local_model()
-                        continue
-                    else:
-                        console.print(f"[bold red]Unknown command {cmd}. Type /help for assistance.[/bold red]")
-                        continue
-                
-                messages.append({"role": "user", "content": user_input})
-                if args.agent:
-                    messages = run_agent_loop(client, model, target_dir, messages, args.max_iterations)
-                else:
-                    messages = run_single_prompt(client, model, messages)
-                    
-            except (KeyboardInterrupt, EOFError):
-                console.print("\n[bold red]Session interrupted. Exiting.[/bold red]")
-                break
+        global TUI_MODE
+        TUI_MODE = True
+        app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations)
+        app.run()
     else:
         messages.append({"role": "user", "content": args.prompt})
         console.print(Panel(f"[bold green]Target Directory:[/bold green] {target_dir.resolve()}\n[bold green]Provider:[/bold green] {provider} ({api_url})\n[bold green]Task:[/bold green] {args.prompt}", title="Agent Run Started"))
