@@ -5,6 +5,8 @@ import re
 import argparse
 import subprocess
 import atexit
+import socket
+import concurrent.futures
 from pathlib import Path
 import httpx
 from openai import OpenAI
@@ -135,26 +137,33 @@ def tool_patch_file(target_dir: Path, path: str, search: str, replace: str) -> s
         safe_path = get_safe_path(target_dir, path)
         if not safe_path.exists():
             return f"Error: File '{path}' does not exist."
-        
+
         original_content = safe_path.read_text(encoding="utf-8")
-        
-        if search in original_content:
-            if original_content.count(search) > 1:
-                return f"Error: Search block found {original_content.count(search)} times in '{path}'. Please provide a larger, unique search block."
-            new_content = original_content.replace(search, replace, 1)
+
+        idx = original_content.find(search)
+        if idx != -1:
+            second_idx = original_content.find(search, idx + len(search))
+            if second_idx != -1:
+                count = original_content.count(search)
+                return f"Error: Search block found {count} times in '{path}'. Please provide a larger, unique search block."
+            new_content = original_content[:idx] + replace + original_content[idx + len(search):]
             safe_path.write_text(new_content, encoding="utf-8")
             return f"Successfully applied patch to '{path}'."
-        
+
         normalized_search = search.replace("\r\n", "\n").strip("\r\n")
         normalized_original = original_content.replace("\r\n", "\n")
-        
-        if normalized_search in normalized_original:
-            if normalized_original.count(normalized_search) > 1:
-                return f"Error: Search block found {normalized_original.count(normalized_search)} times in '{path}'. Please provide a larger, unique search block."
-            new_content = normalized_original.replace(normalized_search, replace.replace("\r\n", "\n"), 1)
+
+        idx = normalized_original.find(normalized_search)
+        if idx != -1:
+            second_idx = normalized_original.find(normalized_search, idx + len(normalized_search))
+            if second_idx != -1:
+                count = normalized_original.count(normalized_search)
+                return f"Error: Search block found {count} times in '{path}'. Please provide a larger, unique search block."
+            normalized_replace = replace.replace("\r\n", "\n")
+            new_content = normalized_original[:idx] + normalized_replace + normalized_original[idx + len(normalized_search):]
             safe_path.write_text(new_content, encoding="utf-8")
             return f"Successfully applied patch (normalized whitespace) to '{path}'."
-            
+
         return f"Error: Could not find exact search block in '{path}'. Please ensure the search block is identical, including indentation."
     except Exception as e:
         return f"Error patching file: {str(e)}"
@@ -250,106 +259,189 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
             
     return results
 
+TOOL_RESULT_PREFIX = "### Execution result of "
+
+def compact_old_tool_results(messages: list[dict], keep_last: int = 1) -> None:
+    """Replace verbatim tool-result content in older turns with a short placeholder.
+
+    Tool results (which can include full file contents) are re-sent to the LLM on
+    every subsequent iteration otherwise, so payload size grows with iterations *
+    accumulated bytes. Older results are already reflected in the model's own
+    replies, so only the most recent `keep_last` need to stay verbatim.
+    """
+    indices = [
+        i for i, m in enumerate(messages)
+        if m.get("role") == "user" and m.get("content", "").startswith(TOOL_RESULT_PREFIX)
+    ]
+    for i in indices[:-keep_last] if keep_last else indices:
+        content = messages[i]["content"]
+        messages[i]["content"] = (
+            f"[Tool result omitted to save context — {len(content)} chars, already processed by the agent]"
+        )
+
+class StreamInterrupted(Exception):
+    """Raised when a user interrupts an in-progress stream (console mode only)."""
+    def __init__(self, partial_text: str):
+        super().__init__("Streaming interrupted by user")
+        self.partial_text = partial_text
+
+def stream_completion(client: OpenAI, model: str, messages: list[dict], on_update, throttle_every: int = 20) -> str:
+    """Stream one chat completion, calling on_update(accumulated_text) at a throttled cadence.
+
+    This is the single place that accumulates chunks and applies bounds-checking/
+    throttling; both console and TUI front-ends (single-shot and agent-loop modes)
+    drive it with a different on_update callback rather than re-implementing the
+    accumulation loop.
+    """
+    parts = []
+    chunk_count = 0
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.2,
+        stream=True
+    )
+    try:
+        for chunk in response:
+            if chunk.choices and chunk.choices[0].delta.content:
+                content = chunk.choices[0].delta.content
+                parts.append(content)
+                chunk_count += 1
+                if chunk_count % throttle_every == 0 or "\n" in content:
+                    on_update("".join(parts))
+    except KeyboardInterrupt:
+        partial_text = "".join(parts)
+        on_update(partial_text)
+        raise StreamInterrupted(partial_text)
+
+    full_text = "".join(parts)
+    on_update(full_text)
+    return full_text
+
+def build_tool_result_message(tool_results: list[dict]) -> str:
+    parts = [
+        f"### Execution result of {tr['tool']} on '{tr['path']}':\n{tr['result']}\n"
+        for tr in tool_results
+    ]
+    return "\n".join(parts)
+
 def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int):
     """Executes the agentic reasoning & execution loop with live updates."""
     for i in range(1, max_iterations + 1):
         console.print(f"\n[bold blue]🤖 Agent Thinking (Step {i}/{max_iterations}) ...[/bold blue]")
-        
+
         assistant_response = ""
         try:
             with Live(console=console, refresh_per_second=8) as live:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=0.2,
-                    stream=True
-                )
-                for chunk in response:
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        content = chunk.choices[0].delta.content
-                        assistant_response += content
-                        live.update(Panel(Markdown(assistant_response), title=f"[bold green]Assistant (Step {i})[/bold green]", border_style="blue"))
-        except KeyboardInterrupt:
+                def on_update(text):
+                    live.update(Panel(Markdown(text), title=f"[bold green]Assistant (Step {i})[/bold green]", border_style="blue"))
+                assistant_response = stream_completion(client, model, messages, on_update)
+        except StreamInterrupted as e:
             console.print("\n[bold yellow]Generation interrupted by user.[/bold yellow]")
+            assistant_response = e.partial_text
             if not assistant_response:
                 break
         except Exception as e:
             console.print(f"[bold red]API call failed:[/bold red] {e}")
             break
-            
+
         if not assistant_response:
             console.print("[bold red]Received empty response from the model.[/bold red]")
             break
-            
+
         messages.append({"role": "assistant", "content": assistant_response})
-        
+
         tool_results = parse_and_execute_tools(target_dir, assistant_response)
-        
+
         if not tool_results:
             console.print("[bold green]✔ No tools triggered or task complete.[/bold green]")
             break
-            
-        result_message_parts = []
-        for tr in tool_results:
-            result_message_parts.append(
-                f"### Execution result of {tr['tool']} on '{tr['path']}':\n{tr['result']}\n"
-            )
-        
-        result_message = "\n".join(result_message_parts)
+
+        result_message = build_tool_result_message(tool_results)
         console.print(f"[bold cyan]Sending tool results back to LLM...[/bold cyan]")
         messages.append({"role": "user", "content": result_message})
-        
+        compact_old_tool_results(messages)
+
     return messages
 
 def run_single_prompt(client: OpenAI, model: str, messages: list[dict]):
     console.print(f"[bold blue]Sending prompt to LLM...[/bold blue]")
-    assistant_response = ""
     try:
         with Live(console=console, refresh_per_second=8) as live:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.2,
-                stream=True
-            )
-            for chunk in response:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
-                    assistant_response += content
-                    live.update(Panel(Markdown(assistant_response), title="Assistant Response", border_style="blue"))
+            def on_update(text):
+                live.update(Panel(Markdown(text), title="Assistant Response", border_style="blue"))
+            assistant_response = stream_completion(client, model, messages, on_update)
         messages.append({"role": "assistant", "content": assistant_response})
-    except KeyboardInterrupt:
+    except StreamInterrupted as e:
         console.print("\n[bold yellow]Generation interrupted by user.[/bold yellow]")
-        if assistant_response:
-            messages.append({"role": "assistant", "content": assistant_response})
+        if e.partial_text:
+            messages.append({"role": "assistant", "content": e.partial_text})
     except Exception as e:
         console.print(f"[bold red]API call failed:[/bold red] {e}")
     return messages
 
+def _probe_provider(url: str) -> bool:
+    try:
+        with httpx.Client(timeout=1.0) as http_client:
+            res = http_client.get(url)
+            return res.status_code == 200
+    except Exception:
+        return False
+
 def detect_provider():
-    """Detects active local provider: LM Studio or llama.cpp."""
-    try:
-        with httpx.Client(timeout=1.0) as http_client:
-            res = http_client.get("http://localhost:1234/v1/models")
-            if res.status_code == 200:
-                return "lmstudio", "http://localhost:1234/v1"
-    except Exception:
-        pass
-        
-    try:
-        with httpx.Client(timeout=1.0) as http_client:
-            res = http_client.get("http://localhost:8080/v1/models")
-            if res.status_code == 200:
-                return "llamacpp", "http://localhost:8080/v1"
-    except Exception:
-        pass
-        
+    """Detects active local provider: LM Studio or llama.cpp. Probes concurrently."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        lmstudio_future = executor.submit(_probe_provider, "http://localhost:1234/v1/models")
+        llamacpp_future = executor.submit(_probe_provider, "http://localhost:8080/v1/models")
+
+        if lmstudio_future.result():
+            return "lmstudio", "http://localhost:1234/v1"
+        if llamacpp_future.result():
+            return "llamacpp", "http://localhost:8080/v1"
+
     return None, None
+
+def resolve_provider_config(provider, api_url, api_key, model):
+    """Resolve provider/api_url/api_key/model CLI args into one concrete configuration."""
+    if not provider and not api_url:
+        detected_prov, detected_url = detect_provider()
+        if detected_prov:
+            provider = detected_prov
+            api_url = detected_url
+            console.print(f"[bold green]✔ Auto-detected active provider: [yellow]{provider}[/yellow] at {api_url}[/bold green]")
+        else:
+            provider = "lmstudio"
+            console.print("[yellow]⚠ No active provider detected on default ports. Defaulting to LM Studio preset.[/yellow]")
+
+    provider_defaults = {
+        "lmstudio": ("http://localhost:1234/v1", "lm-studio"),
+        "llamacpp": ("http://localhost:8080/v1", "not-needed"),
+    }
+    default_url, default_key = provider_defaults.get(provider, provider_defaults["lmstudio"])
+    api_url = api_url or default_url
+    api_key = api_key or default_key
+    model = model or "local-model"
+
+    return provider, api_url, api_key, model
 
 def list_downloaded_models():
     """List GGUF files in the models directory."""
     models_dir = get_models_dir()
     return list(models_dir.glob("*.gguf"))
+
+_running_servers: list[subprocess.Popen] = []
+
+def _terminate_tracked_servers():
+    for proc in _running_servers:
+        if proc.poll() is None:
+            proc.terminate()
+
+atexit.register(_terminate_tracked_servers)
+
+def is_port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("localhost", port)) == 0
 
 class DownloadModelScreen(ModalScreen):
     CSS = """
@@ -462,6 +554,10 @@ class ServeModelScreen(ModalScreen):
                 yield Button("Start Server", variant="success", id="start-btn")
                 yield Button("Cancel", variant="error", id="cancel-serve-btn")
 
+    def __init__(self):
+        super().__init__()
+        self.proc = None
+
     def on_mount(self):
         gguf_files = list_downloaded_models()
         options = [(f.name, str(f.absolute())) for f in gguf_files]
@@ -475,30 +571,58 @@ class ServeModelScreen(ModalScreen):
         if event.button.id == "cancel-serve-btn":
             self.app.pop_screen()
         elif event.button.id == "start-btn":
+            if self.proc is not None:
+                self.stop_server()
+                return
             file_path = self.query_one("#serve-model-select").value
             port = self.query_one("#port-input").value
             if file_path and file_path != Select.BLANK and port:
                 self.start_server(file_path, port)
 
     def start_server(self, file_path, port):
-        cmd = ["llama-server", "-m", file_path, "--port", port, "-c", "4096"]
         status = self.query_one("#serve-status")
         try:
-            # Fix Subprocess pipes deadlock: use subprocess.DEVNULL
+            port_int = int(port)
+        except ValueError:
+            status.update("Error: Port must be a number.")
+            return
+
+        if is_port_in_use(port_int):
+            status.update(f"Error: Port {port} is already in use by another process.")
+            return
+
+        cmd = ["llama-server", "-m", file_path, "--port", port, "-c", "4096"]
+        try:
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 text=True
             )
-            atexit.register(lambda: proc.terminate())
+            self.proc = proc
+            _running_servers.append(proc)
             status.update(f"Server launched on port {port} (PID {proc.pid})")
-            self.query_one("#start-btn").disabled = True
+            start_btn = self.query_one("#start-btn")
+            start_btn.label = "Stop Server"
+            start_btn.variant = "error"
             self.query_one("#cancel-serve-btn").label = "Close"
         except FileNotFoundError:
             status.update("Error: 'llama-server' binary not found.")
         except Exception as e:
             status.update(f"Failed: {e}")
+
+    def stop_server(self):
+        status = self.query_one("#serve-status")
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+        if self.proc in _running_servers:
+            _running_servers.remove(self.proc)
+        self.proc = None
+        status.update("Server stopped.")
+        start_btn = self.query_one("#start-btn")
+        start_btn.label = "Start Server"
+        start_btn.variant = "success"
+        self.query_one("#cancel-serve-btn").label = "Cancel"
 
 
 class ChatMessage(Static):
@@ -514,6 +638,17 @@ class ChatMessage(Static):
             return Panel(Markdown(self.text), title="Assistant", border_style="blue", expand=False)
         else: # System or tool
             return Panel(self.text, title=self.role.capitalize(), border_style="yellow", expand=False)
+
+class StreamMessage(Static):
+    """A chat widget that accumulates streamed text and re-renders it on demand."""
+    def __init__(self, title: str = "Assistant"):
+        super().__init__("")
+        self.content = ""
+        self.stream_title = title
+
+    def update_content(self, full_text: str):
+        self.content = full_text
+        self.update(Panel(Markdown(self.content), title=self.stream_title, border_style="blue", expand=False))
 
 class LocalCoderApp(App):
     CSS = """
@@ -555,6 +690,13 @@ class LocalCoderApp(App):
         # Display welcome message
         self.chat_history.mount(ChatMessage("Welcome to Local Coder! Type your instruction below.", "system"))
 
+    def _trim_chat_history(self, max_widgets: int = 300):
+        """Cap retained chat widgets so a long session doesn't grow memory/render cost unbounded."""
+        children = list(self.chat_history.children)
+        if len(children) > max_widgets:
+            for child in children[: len(children) - max_widgets]:
+                child.remove()
+
     async def on_input_submitted(self, message: Input.Submitted) -> None:
         if self.is_processing:
             return
@@ -572,7 +714,8 @@ class LocalCoderApp(App):
         self.messages.append({"role": "user", "content": user_input})
         await self.chat_history.mount(ChatMessage(user_input, "user"))
         self.chat_history.scroll_end(animate=False)
-        
+        self._trim_chat_history()
+
         self.is_processing = True
         if self.agent_mode:
             self.run_agent_loop_async()
@@ -618,43 +761,19 @@ class LocalCoderApp(App):
     @work(thread=True)
     def run_single_prompt_async(self):
         self.call_from_thread(self.input_box.set_class, True, "-disabled") # just logic
-        
-        assistant_response = ""
-        try:
-            # We must mount a ChatMessage first to stream into it.
-            # But ChatMessage relies on self.text, we need a way to update it.
-            
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=self.messages,
-                temperature=0.2,
-                stream=True
-            )
-            
-            # Since updating UI from thread requires call_from_thread, and we want live streaming:
-            # We can create a widget and update its text.
-            class StreamMessage(Static):
-                def __init__(self):
-                    super().__init__("")
-                    self.content = ""
-                def update_content(self, chunk):
-                    self.content += chunk
-                    self.update(Panel(Markdown(self.content), title="Assistant", border_style="blue", expand=False))
-                    
-            stream_msg = StreamMessage()
-            self.call_from_thread(self.chat_history.mount, stream_msg)
-            
-            for chunk in response:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
-                    assistant_response += content
-                    self.call_from_thread(stream_msg.update_content, content)
-                    if "\n" in content:
-                        self.call_from_thread(self.chat_history.scroll_end, animate=False)
+
+        stream_msg = StreamMessage("Assistant")
+        self.call_from_thread(self.chat_history.mount, stream_msg)
+
+        def on_update(text):
+            self.call_from_thread(stream_msg.update_content, text)
             self.call_from_thread(self.chat_history.scroll_end, animate=False)
-                    
+
+        try:
+            assistant_response = stream_completion(self.client, self.model, self.messages, on_update)
+            self.call_from_thread(self._trim_chat_history)
             self.messages.append({"role": "assistant", "content": assistant_response})
-            
+
         except Exception as e:
             self.call_from_thread(self.chat_history.mount, ChatMessage(f"Error: {e}", "system"))
         finally:
@@ -666,55 +785,36 @@ class LocalCoderApp(App):
             for i in range(1, self.max_iterations + 1):
                 self.call_from_thread(self.chat_history.mount, ChatMessage(f"🤖 Agent Thinking (Step {i}/{self.max_iterations}) ...", "system"))
                 self.call_from_thread(self.chat_history.scroll_end, animate=False)
-                
-                assistant_response = ""
-                class StreamMessage(Static):
-                    def __init__(self):
-                        super().__init__("")
-                        self.content = ""
-                    def update_content(self, chunk):
-                        self.content += chunk
-                        self.update(Panel(Markdown(self.content), title=f"Assistant (Step {i})", border_style="blue", expand=False))
-                        
-                stream_msg = StreamMessage()
+
+                stream_msg = StreamMessage(f"Assistant (Step {i})")
                 self.call_from_thread(self.chat_history.mount, stream_msg)
-                
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=self.messages,
-                    temperature=0.2,
-                    stream=True
-                )
-                
-                for chunk in response:
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        content = chunk.choices[0].delta.content
-                        assistant_response += content
-                        self.call_from_thread(stream_msg.update_content, content)
-                        if "\n" in content:
-                            self.call_from_thread(self.chat_history.scroll_end, animate=False)
-                self.call_from_thread(self.chat_history.scroll_end, animate=False)
-                        
+
+                def on_update(text, _stream_msg=stream_msg):
+                    self.call_from_thread(_stream_msg.update_content, text)
+                    self.call_from_thread(self.chat_history.scroll_end, animate=False)
+
+                assistant_response = stream_completion(self.client, self.model, self.messages, on_update)
+
                 self.messages.append({"role": "assistant", "content": assistant_response})
-                
+
                 # Execute tools
                 tool_results = parse_and_execute_tools(self.target_dir, assistant_response)
-                
+
                 if not tool_results:
                     self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))
                     self.call_from_thread(self.chat_history.scroll_end, animate=False)
                     break
-                    
-                result_message_parts = []
+
                 for tr in tool_results:
-                    result_message_parts.append(f"### Execution result of {tr['tool']} on '{tr['path']}':\n{tr['result']}\n")
                     # Show tool result in UI
                     self.call_from_thread(self.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr['path']}:\n{tr['result']}", "system"))
-                    
-                result_message = "\n".join(result_message_parts)
+
+                result_message = build_tool_result_message(tool_results)
                 self.messages.append({"role": "user", "content": result_message})
+                compact_old_tool_results(self.messages)
                 self.call_from_thread(self.chat_history.scroll_end, animate=False)
-                
+                self.call_from_thread(self._trim_chat_history)
+
         except Exception as e:
             self.call_from_thread(self.chat_history.mount, ChatMessage(f"Error: {e}", "system"))
         finally:
@@ -736,33 +836,9 @@ def main():
     
     args = parser.parse_args()
     
-    api_url = args.api_url
-    api_key = args.api_key
-    model = args.model
-    provider = args.provider
-    
-    if not provider and not api_url:
-        detected_prov, detected_url = detect_provider()
-        if detected_prov:
-            provider = detected_prov
-            api_url = detected_url
-            console.print(f"[bold green]✔ Auto-detected active provider: [yellow]{provider}[/yellow] at {api_url}[/bold green]")
-        else:
-            provider = "lmstudio"
-            console.print("[yellow]⚠ No active provider detected on default ports. Defaulting to LM Studio preset.[/yellow]")
-            
-    if provider == "lmstudio":
-        if not api_url: api_url = "http://localhost:1234/v1"
-        if not api_key: api_key = "lm-studio"
-        if not model: model = "local-model"
-    elif provider == "llamacpp":
-        if not api_url: api_url = "http://localhost:8080/v1"
-        if not api_key: api_key = "not-needed"
-        if not model: model = "local-model"
-    else:
-        if not api_url: api_url = "http://localhost:1234/v1"
-        if not api_key: api_key = "lm-studio"
-        if not model: model = "local-model"
+    provider, api_url, api_key, model = resolve_provider_config(
+        args.provider, args.api_url, args.api_key, args.model
+    )
 
     target_dir = Path(args.target_dir).resolve()
     if not target_dir.exists():
