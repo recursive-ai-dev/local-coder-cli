@@ -18,8 +18,9 @@ from rich.prompt import Prompt
 from rich.align import Align
 
 from textual.app import App, ComposeResult
-from textual.containers import VerticalScroll
-from textual.widgets import Header, Footer, Static, Input
+from textual.containers import VerticalScroll, Vertical, Horizontal
+from textual.widgets import Header, Footer, Static, Input, Button, Select, ProgressBar, Label
+from textual.screen import ModalScreen
 from textual import work
 
 
@@ -138,14 +139,18 @@ def tool_patch_file(target_dir: Path, path: str, search: str, replace: str) -> s
         original_content = safe_path.read_text(encoding="utf-8")
         
         if search in original_content:
+            if original_content.count(search) > 1:
+                return f"Error: Search block found {original_content.count(search)} times in '{path}'. Please provide a larger, unique search block."
             new_content = original_content.replace(search, replace, 1)
             safe_path.write_text(new_content, encoding="utf-8")
             return f"Successfully applied patch to '{path}'."
         
-        normalized_search = search.replace("\r\n", "\n").strip()
+        normalized_search = search.replace("\r\n", "\n").strip("\r\n")
         normalized_original = original_content.replace("\r\n", "\n")
         
         if normalized_search in normalized_original:
+            if normalized_original.count(normalized_search) > 1:
+                return f"Error: Search block found {normalized_original.count(normalized_search)} times in '{path}'. Please provide a larger, unique search block."
             new_content = normalized_original.replace(normalized_search, replace.replace("\r\n", "\n"), 1)
             safe_path.write_text(new_content, encoding="utf-8")
             return f"Successfully applied patch (normalized whitespace) to '{path}'."
@@ -200,10 +205,10 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
     for m in re.finditer(r"<read_file>(.*?)</read_file>", text, re.DOTALL):
         matches.append((m.start(), "read_file", m))
         
-    for m in re.finditer(r"<write_file\s+path=([\"']?)(.*?)\1>(.*?)</write_file>", text, re.DOTALL):
+    for m in re.finditer(r"<write_file\s+path=([\"']?)(.*?)\1[^>]*>(.*?)</write_file>", text, re.DOTALL):
         matches.append((m.start(), "write_file", m))
         
-    for m in re.finditer(r"<patch_file\s+path=([\"']?)(.*?)\1>\s*<search>(.*?)</search>\s*<replace>(.*?)</replace>\s*</patch_file>", text, re.DOTALL):
+    for m in re.finditer(r"<patch_file\s+path=([\"']?)(.*?)\1[^>]*>\s*<search>(.*?)</search>\s*<replace>(.*?)</replace>\s*</patch_file>", text, re.DOTALL):
         matches.append((m.start(), "patch_file", m))
         
     matches.sort(key=lambda x: x[0])
@@ -260,8 +265,8 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
                     stream=True
                 )
                 for chunk in response:
-                    content = chunk.choices[0].delta.content
-                    if content:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
                         assistant_response += content
                         live.update(Panel(Markdown(assistant_response), title=f"[bold green]Assistant (Step {i})[/bold green]", border_style="blue"))
         except KeyboardInterrupt:
@@ -308,8 +313,8 @@ def run_single_prompt(client: OpenAI, model: str, messages: list[dict]):
                 stream=True
             )
             for chunk in response:
-                content = chunk.choices[0].delta.content
-                if content:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
                     assistant_response += content
                     live.update(Panel(Markdown(assistant_response), title="Assistant Response", border_style="blue"))
         messages.append({"role": "assistant", "content": assistant_response})
@@ -341,137 +346,159 @@ def detect_provider():
         
     return None, None
 
-def download_huggingface_model():
-    """Interactively select and download a model from Hugging Face."""
-    table = Table(title="Available Hugging Face Presets (<=8B)", show_header=True, header_style="bold green")
-    table.add_column("Index", style="cyan", justify="center")
-    table.add_column("Model Name", style="magenta")
-    table.add_column("Hugging Face Repository")
-    
-    for idx, data in MODELS_PRESETS.items():
-        table.add_row(idx, data["name"], data["repo"])
-    console.print(table)
-    
-    selection = Prompt.ask("Select model index to download", choices=list(MODELS_PRESETS.keys()) + ["exit"])
-    if selection == "exit":
-        return
-        
-    model_data = MODELS_PRESETS[selection]
-    quant_choices = list(model_data["quants"].keys())
-    quant_selection = Prompt.ask(f"Select quantization level for {model_data['name']}", choices=quant_choices + ["exit"])
-    if quant_selection == "exit":
-        return
-        
-    filename = model_data["quants"][quant_selection]
-    repo_id = model_data["repo"]
-    destination_file = get_models_dir() / filename
-    
-    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
-    
-    from rich.progress import Progress, TextColumn, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn
-    
-    console.print(f"\n[cyan]Starting download from Hugging Face:[/cyan] {url}")
-    try:
-        with httpx.stream("GET", url, follow_redirects=True) as response:
-            if response.status_code != 200:
-                console.print(f"[bold red]HTTP error {response.status_code}: Model file not found on HF.[/bold red]")
-                return
-                
-            total_size = int(response.headers.get("content-length", 0))
-            
-            with Progress(
-                TextColumn("[bold blue]{task.description}"),
-                BarColumn(),
-                DownloadColumn(),
-                TransferSpeedColumn(),
-                TimeRemainingColumn(),
-                console=console
-            ) as progress:
-                task = progress.add_task(f"Downloading {filename}", total=total_size)
-                
-                with open(destination_file, "wb") as f:
-                    for chunk in response.iter_bytes(chunk_size=8192):
-                        f.write(chunk)
-                        progress.update(task, advance=len(chunk))
-                        
-        console.print(f"[bold green]✔ Model downloaded successfully and saved to: {destination_file}[/bold green]")
-    except Exception as e:
-        console.print(f"[bold red]Download failed: {e}[/bold red]")
-
 def list_downloaded_models():
     """List GGUF files in the models directory."""
     models_dir = get_models_dir()
-    gguf_files = list(models_dir.glob("*.gguf"))
-    
-    table = Table(title=f"Local GGUF Models ({models_dir})", show_header=True, header_style="bold magenta")
-    table.add_column("Filename", style="blue")
-    table.add_column("Size", style="green", justify="right")
-    
-    for f in gguf_files:
-        size_mb = f.stat().st_size / (1024 * 1024)
-        table.add_row(f.name, f"{size_mb:.1f} MB")
-        
-    if not gguf_files:
-        table.add_row("No GGUF models found.", "")
-        
-    console.print(table)
-    return gguf_files
+    return list(models_dir.glob("*.gguf"))
 
-def serve_local_model():
-    """Launch llama-server with one of the downloaded GGUF models."""
-    gguf_files = list_downloaded_models()
-    if not gguf_files:
-        console.print("[yellow]Please download a model first using the [bold]/models[/bold] option.[/yellow]")
-        return
-        
-    choices = [str(i) for i in range(1, len(gguf_files) + 1)]
-    for idx, f in enumerate(gguf_files, 1):
-        console.print(f"[{idx}] {f.name}")
-        
-    selection = Prompt.ask("Select model index to serve", choices=choices + ["exit"])
-    if selection == "exit":
-        return
-        
-    selected_file = gguf_files[int(selection) - 1]
-    port = Prompt.ask("Choose port to run llama-server on", default="8080")
-    
-    # Construct llama-server command
-    cmd = ["llama-server", "-m", str(selected_file), "--port", port, "-c", "4096"]
-    
-    console.print(f"[cyan]Attempting to start local llama-server...[/cyan]")
-    console.print(f"[dim]Running command: {' '.join(cmd)}[/dim]")
-    
-    try:
-        # Launch llama-server in the background as a subprocess
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        atexit.register(lambda: proc.terminate())
-        console.print(f"[bold green]✔ Server launched in background with PID {proc.pid}![/bold green]")
-        console.print(f"[green]You can now connect the CLI to this server using --provider llamacpp --port {port}[/green]")
-    except FileNotFoundError:
-        console.print("[bold red]Error: 'llama-server' binary not found in your system PATH.[/bold red]")
-        console.print("[yellow]Make sure you have llama.cpp installed and llama-server added to your system PATH.[/yellow]")
-        console.print(f"[yellow]Alternatively, run it manually in a separate shell:[/yellow]\n  [bold]llama-server -m {selected_file} --port {port} -c 4096[/bold]")
-    except Exception as e:
-        console.print(f"[bold red]Failed to start server subprocess: {e}[/bold red]")
+class DownloadModelScreen(ModalScreen):
+    CSS = """
+    DownloadModelScreen {
+        align: center middle;
+    }
+    #download-dialog {
+        padding: 1 2;
+        width: 60;
+        height: auto;
+        border: thick $background 80%;
+        background: $surface;
+    }
+    """
+    def compose(self) -> ComposeResult:
+        with Vertical(id="download-dialog"):
+            yield Label("Select Model to Download")
+            options = [(data["name"], k) for k, data in MODELS_PRESETS.items()]
+            yield Select(options, id="model-select")
+            yield Label("Select Quantization", id="quant-label")
+            yield Select([], id="quant-select", disabled=True)
+            yield ProgressBar(total=100, show_eta=False, id="progress-bar")
+            yield Label("", id="status-label")
+            with Horizontal():
+                yield Button("Download", variant="success", id="download-btn", disabled=True)
+                yield Button("Cancel", variant="error", id="cancel-btn")
 
-def print_help_repl():
-    table = Table(title="Available Interactive Commands", show_header=True, header_style="bold green")
-    table.add_column("Command", style="cyan")
-    table.add_column("Description")
-    table.add_row("/help", "Show this help screen")
-    table.add_row("/models", "Manage (list & download) local GGUF models")
-    table.add_row("/serve", "Serve a downloaded model using llama-server")
-    table.add_row("/system", "Print the active system prompt")
-    table.add_row("/provider", "Display current provider and connection settings")
-    table.add_row("/dir", "List files in the target directory")
-    table.add_row("/clear", "Clear history or screen")
-    table.add_row("/exit or /quit", "Exit the interactive session")
-    console.print(table)
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "model-select":
+            model_key = event.select.value
+            if model_key and model_key != Select.BLANK:
+                model_data = MODELS_PRESETS[model_key]
+                quants = [(k, k) for k in model_data["quants"].keys()]
+                quant_select = self.query_one("#quant-select")
+                quant_select.set_options(quants)
+                quant_select.disabled = False
+        elif event.select.id == "quant-select":
+            if event.select.value and event.select.value != Select.BLANK:
+                self.query_one("#download-btn").disabled = False
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel-btn":
+            self.app.pop_screen()
+        elif event.button.id == "download-btn":
+            model_key = self.query_one("#model-select").value
+            quant_key = self.query_one("#quant-select").value
+            self.do_download(model_key, quant_key)
+            event.button.disabled = True
+            self.query_one("#cancel-btn").disabled = True
+
+    @work(thread=True)
+    def do_download(self, model_key, quant_key):
+        model_data = MODELS_PRESETS[model_key]
+        filename = model_data["quants"][quant_key]
+        repo_id = model_data["repo"]
+        destination_file = get_models_dir() / filename
+        url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+        
+        status = self.query_one("#status-label")
+        pb = self.query_one("#progress-bar")
+        
+        self.app.call_from_thread(status.update, "Connecting to HF...")
+        
+        try:
+            with httpx.stream("GET", url, follow_redirects=True) as response:
+                if response.status_code != 200:
+                    self.app.call_from_thread(status.update, f"HTTP Error {response.status_code}")
+                    self.app.call_from_thread(self.query_one("#cancel-btn").__setattr__, "disabled", False)
+                    return
+                    
+                total_size = int(response.headers.get("content-length", 0))
+                self.app.call_from_thread(pb.update, total=total_size)
+                
+                downloaded = 0
+                with open(destination_file, "wb") as f:
+                    for chunk in response.iter_bytes(chunk_size=8192):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        self.app.call_from_thread(pb.update, progress=downloaded)
+                        
+            self.app.call_from_thread(status.update, "Downloaded successfully!")
+            self.app.call_from_thread(self.query_one("#cancel-btn").__setattr__, "label", "Close")
+            self.app.call_from_thread(self.query_one("#cancel-btn").__setattr__, "disabled", False)
+            
+        except Exception as e:
+            self.app.call_from_thread(status.update, f"Error: {e}")
+            self.app.call_from_thread(self.query_one("#cancel-btn").__setattr__, "disabled", False)
+
+class ServeModelScreen(ModalScreen):
+    CSS = """
+    ServeModelScreen {
+        align: center middle;
+    }
+    #serve-dialog {
+        padding: 1 2;
+        width: 60;
+        height: auto;
+        border: thick $background 80%;
+        background: $surface;
+    }
+    """
+    def compose(self) -> ComposeResult:
+        with Vertical(id="serve-dialog"):
+            yield Label("Select Model to Serve")
+            yield Select([], id="serve-model-select")
+            yield Label("Port:")
+            yield Input(value="8080", id="port-input")
+            yield Label("", id="serve-status")
+            with Horizontal():
+                yield Button("Start Server", variant="success", id="start-btn")
+                yield Button("Cancel", variant="error", id="cancel-serve-btn")
+
+    def on_mount(self):
+        gguf_files = list_downloaded_models()
+        options = [(f.name, str(f.absolute())) for f in gguf_files]
+        select = self.query_one("#serve-model-select")
+        select.set_options(options)
+        if not options:
+            self.query_one("#serve-status").update("No models found. Download one first.")
+            self.query_one("#start-btn").disabled = True
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel-serve-btn":
+            self.app.pop_screen()
+        elif event.button.id == "start-btn":
+            file_path = self.query_one("#serve-model-select").value
+            port = self.query_one("#port-input").value
+            if file_path and file_path != Select.BLANK and port:
+                self.start_server(file_path, port)
+
+    def start_server(self, file_path, port):
+        cmd = ["llama-server", "-m", file_path, "--port", port, "-c", "4096"]
+        status = self.query_one("#serve-status")
+        try:
+            # Fix Subprocess pipes deadlock: use subprocess.DEVNULL
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True
+            )
+            atexit.register(lambda: proc.terminate())
+            status.update(f"Server launched on port {port} (PID {proc.pid})")
+            self.query_one("#start-btn").disabled = True
+            self.query_one("#cancel-serve-btn").label = "Close"
+        except FileNotFoundError:
+            status.update("Error: 'llama-server' binary not found.")
+        except Exception as e:
+            status.update(f"Failed: {e}")
 
 
 class ChatMessage(Static):
@@ -546,6 +573,7 @@ class LocalCoderApp(App):
         await self.chat_history.mount(ChatMessage(user_input, "user"))
         self.chat_history.scroll_end(animate=False)
         
+        self.is_processing = True
         if self.agent_mode:
             self.run_agent_loop_async()
         else:
@@ -567,13 +595,28 @@ class LocalCoderApp(App):
             sys_prompt = self.messages[0]
             self.messages = [sys_prompt]
             await self.chat_history.mount(ChatMessage("History cleared.", "system"))
+        elif cmd == "/models":
+            self.push_screen(DownloadModelScreen())
+        elif cmd == "/serve":
+            self.push_screen(ServeModelScreen())
+        elif cmd == "/help":
+            help_text = (
+                "**Available Commands:**\n"
+                "- `/help`: Show this help screen\n"
+                "- `/models`: Manage (list & download) local GGUF models\n"
+                "- `/serve`: Serve a downloaded model using llama-server\n"
+                "- `/dir`: List files in the target directory\n"
+                "- `/clear`: Clear history or screen\n"
+                "- `/exit` or `/quit`: Exit the interactive session"
+            )
+            await self.chat_history.mount(ChatMessage(help_text, "system"))
+            self.chat_history.scroll_end(animate=False)
         else:
-            await self.chat_history.mount(ChatMessage(f"Command {cmd} not supported in TUI yet. Supported: /exit, /clear, /dir", "system"))
+            await self.chat_history.mount(ChatMessage(f"Command {cmd} not supported in TUI yet. Supported: /exit, /clear, /dir, /models, /serve, /help", "system"))
             self.chat_history.scroll_end(animate=False)
 
     @work(thread=True)
     def run_single_prompt_async(self):
-        self.is_processing = True
         self.call_from_thread(self.input_box.set_class, True, "-disabled") # just logic
         
         assistant_response = ""
@@ -602,11 +645,13 @@ class LocalCoderApp(App):
             self.call_from_thread(self.chat_history.mount, stream_msg)
             
             for chunk in response:
-                content = chunk.choices[0].delta.content
-                if content:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
                     assistant_response += content
                     self.call_from_thread(stream_msg.update_content, content)
-                    self.call_from_thread(self.chat_history.scroll_end, animate=False)
+                    if "\n" in content:
+                        self.call_from_thread(self.chat_history.scroll_end, animate=False)
+            self.call_from_thread(self.chat_history.scroll_end, animate=False)
                     
             self.messages.append({"role": "assistant", "content": assistant_response})
             
@@ -617,7 +662,6 @@ class LocalCoderApp(App):
 
     @work(thread=True)
     def run_agent_loop_async(self):
-        self.is_processing = True
         try:
             for i in range(1, self.max_iterations + 1):
                 self.call_from_thread(self.chat_history.mount, ChatMessage(f"🤖 Agent Thinking (Step {i}/{self.max_iterations}) ...", "system"))
@@ -643,11 +687,13 @@ class LocalCoderApp(App):
                 )
                 
                 for chunk in response:
-                    content = chunk.choices[0].delta.content
-                    if content:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
                         assistant_response += content
                         self.call_from_thread(stream_msg.update_content, content)
-                        self.call_from_thread(self.chat_history.scroll_end, animate=False)
+                        if "\n" in content:
+                            self.call_from_thread(self.chat_history.scroll_end, animate=False)
+                self.call_from_thread(self.chat_history.scroll_end, animate=False)
                         
                 self.messages.append({"role": "assistant", "content": assistant_response})
                 

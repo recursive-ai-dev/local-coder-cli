@@ -70,12 +70,17 @@ class TestLocalCoder(unittest.TestCase):
         patched_content = local_coder.tool_read_file(self.test_dir, "math_utils.py")
         self.assertIn("# Subtract b from a", patched_content)
 
+        # Multi-match
+        local_coder.tool_write_file(self.test_dir, "math_utils_2.py", "def a():\n  pass\n\ndef a():\n  pass")
+        patch_res2 = local_coder.tool_patch_file(self.test_dir, "math_utils_2.py", "def a():\n  pass", "def a():\n  return 1")
+        self.assertIn("Error: Search block found 2 times", patch_res2)
+
     def test_parse_and_execute_tools(self):
         import textwrap
         # We simulate the LLM's response containing multiple tool blocks
         llm_response = textwrap.dedent("""\
             I will create a script and verify it.
-            <write_file path="script.py">
+            <write_file path="script.py" lang="python">
             print("Hello CLI")
             </write_file>
             
