@@ -73,7 +73,7 @@ class TestLocalCoder(unittest.TestCase):
         # Multi-match
         local_coder.tool_write_file(self.test_dir, "math_utils_2.py", "def a():\n  pass\n\ndef a():\n  pass")
         patch_res2 = local_coder.tool_patch_file(self.test_dir, "math_utils_2.py", "def a():\n  pass", "def a():\n  return 1")
-        self.assertIn("Error: Search block found 2 times", patch_res2)
+        self.assertIn("Error: Search block found multiple times", patch_res2)
 
     def test_parse_and_execute_tools(self):
         import textwrap
