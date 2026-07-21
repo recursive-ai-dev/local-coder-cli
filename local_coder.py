@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import time
 import sys
 import re
 import argparse
@@ -105,7 +106,14 @@ def tool_list_dir(target_dir: Path, path: str) -> str:
         
         if not entries:
             return "Directory is empty."
-        return "\n".join(sorted(entries))
+
+        entries = sorted(entries)
+        if len(entries) > 200:
+            hidden = len(entries) - 200
+            entries = entries[:200]
+            entries.append(f"... [{hidden} more items hidden]")
+
+        return "\n".join(entries)
     except Exception as e:
         return f"Error listing directory: {str(e)}"
 
@@ -117,7 +125,15 @@ def tool_read_file(target_dir: Path, path: str) -> str:
             return f"Error: File '{path}' does not exist."
         if not safe_path.is_file():
             return f"Error: Path '{path}' is not a file."
-        return safe_path.read_text(encoding="utf-8")
+
+        file_size = safe_path.stat().st_size
+        if file_size > 500 * 1024:
+            return f"Error: File '{path}' is too large to read ({file_size} bytes). Maximum allowed size is 500KB."
+
+        try:
+            return safe_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return f"Error: File '{path}' is not a valid UTF-8 text file (could be binary)."
     except Exception as e:
         return f"Error reading file: {str(e)}"
 
@@ -125,8 +141,17 @@ def tool_write_file(target_dir: Path, path: str, content: str) -> str:
     try:
         target_dir = target_dir.resolve()
         safe_path = get_safe_path(target_dir, path)
+
+        orig_mode = None
+        if safe_path.exists():
+            orig_mode = os.stat(safe_path).st_mode
+
         safe_path.parent.mkdir(parents=True, exist_ok=True)
         safe_path.write_text(content, encoding="utf-8")
+
+        if orig_mode is not None:
+            os.chmod(safe_path, orig_mode)
+
         return f"Successfully wrote {len(content)} bytes to '{path}'."
     except Exception as e:
         return f"Error writing file: {str(e)}"
@@ -139,16 +164,23 @@ def tool_patch_file(target_dir: Path, path: str, search: str, replace: str) -> s
             return f"Error: File '{path}' does not exist."
 
         original_content = safe_path.read_text(encoding="utf-8")
+        orig_mode = os.stat(safe_path).st_mode
+        has_crlf = "\r\n" in original_content
+
+        def write_patch(new_content, message):
+            if has_crlf:
+                new_content = new_content.replace("\n", "\r\n")
+            safe_path.write_text(new_content, encoding="utf-8")
+            os.chmod(safe_path, orig_mode)
+            return message
 
         idx = original_content.find(search)
         if idx != -1:
             second_idx = original_content.find(search, idx + len(search))
             if second_idx != -1:
-                count = original_content.count(search)
-                return f"Error: Search block found {count} times in '{path}'. Please provide a larger, unique search block."
+                return f"Error: Search block found multiple times in '{path}'. Please provide a larger, unique search block."
             new_content = original_content[:idx] + replace + original_content[idx + len(search):]
-            safe_path.write_text(new_content, encoding="utf-8")
-            return f"Successfully applied patch to '{path}'."
+            return write_patch(new_content, f"Successfully applied patch to '{path}'.")
 
         normalized_search = search.replace("\r\n", "\n").strip("\r\n")
         normalized_original = original_content.replace("\r\n", "\n")
@@ -157,12 +189,10 @@ def tool_patch_file(target_dir: Path, path: str, search: str, replace: str) -> s
         if idx != -1:
             second_idx = normalized_original.find(normalized_search, idx + len(normalized_search))
             if second_idx != -1:
-                count = normalized_original.count(normalized_search)
-                return f"Error: Search block found {count} times in '{path}'. Please provide a larger, unique search block."
+                return f"Error: Search block found multiple times in '{path}'. Please provide a larger, unique search block."
             normalized_replace = replace.replace("\r\n", "\n")
             new_content = normalized_original[:idx] + normalized_replace + normalized_original[idx + len(normalized_search):]
-            safe_path.write_text(new_content, encoding="utf-8")
-            return f"Successfully applied patch (normalized whitespace) to '{path}'."
+            return write_patch(new_content, f"Successfully applied patch (normalized whitespace) to '{path}'.")
 
         return f"Error: Could not find exact search block in '{path}'. Please ensure the search block is identical, including indentation."
     except Exception as e:
@@ -208,16 +238,16 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
     """Parse XML tags in response and execute tools in the order they appear."""
     matches = []
     
-    for m in re.finditer(r"<list_dir>(.*?)</list_dir>", text, re.DOTALL):
+    for m in re.finditer(r"<list_dir>(.*?)</list_dir\s*>", text, re.DOTALL):
         matches.append((m.start(), "list_dir", m))
         
-    for m in re.finditer(r"<read_file>(.*?)</read_file>", text, re.DOTALL):
+    for m in re.finditer(r"<read_file>(.*?)</read_file\s*>", text, re.DOTALL):
         matches.append((m.start(), "read_file", m))
         
-    for m in re.finditer(r"<write_file\s+path=([\"']?)(.*?)\1[^>]*>(.*?)</write_file>", text, re.DOTALL):
+    for m in re.finditer(r"<write_file\s+path=([\"']?)(.*?)\1[^>]*>(.*?)</write_file\s*>", text, re.DOTALL):
         matches.append((m.start(), "write_file", m))
         
-    for m in re.finditer(r"<patch_file\s+path=([\"']?)(.*?)\1[^>]*>\s*<search>(.*?)</search>\s*<replace>(.*?)</replace>\s*</patch_file>", text, re.DOTALL):
+    for m in re.finditer(r"<patch_file\s+path=([\"']?)(.*?)\1[^>]*>\s*<search>(.*?)</search>\s*<replace>(.*?)</replace>\s*</patch_file\s*>", text, re.DOTALL):
         matches.append((m.start(), "patch_file", m))
         
     matches.sort(key=lambda x: x[0])
@@ -271,7 +301,7 @@ def compact_old_tool_results(messages: list[dict], keep_last: int = 1) -> None:
     """
     indices = [
         i for i, m in enumerate(messages)
-        if m.get("role") == "user" and m.get("content", "").startswith(TOOL_RESULT_PREFIX)
+        if m.get("role") == "user" and m.get("is_tool_result", False)
     ]
     for i in indices[:-keep_last] if keep_last else indices:
         content = messages[i]["content"]
@@ -299,7 +329,8 @@ def stream_completion(client: OpenAI, model: str, messages: list[dict], on_updat
         model=model,
         messages=messages,
         temperature=0.2,
-        stream=True
+        stream=True,
+        timeout=120.0
     )
     try:
         for chunk in response:
@@ -359,7 +390,7 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
 
         result_message = build_tool_result_message(tool_results)
         console.print(f"[bold cyan]Sending tool results back to LLM...[/bold cyan]")
-        messages.append({"role": "user", "content": result_message})
+        messages.append({"role": "user", "content": result_message, "is_tool_result": True})
         compact_old_tool_results(messages)
 
     return messages
@@ -516,17 +547,25 @@ class DownloadModelScreen(ModalScreen):
                 self.app.call_from_thread(pb.update, total=total_size)
                 
                 downloaded = 0
+                last_update = time.time()
                 with open(destination_file, "wb") as f:
                     for chunk in response.iter_bytes(chunk_size=8192):
                         f.write(chunk)
                         downloaded += len(chunk)
-                        self.app.call_from_thread(pb.update, progress=downloaded)
                         
+                        now = time.time()
+                        if now - last_update > 0.1:
+                            self.app.call_from_thread(pb.update, progress=downloaded)
+                            last_update = now
+
+            self.app.call_from_thread(pb.update, progress=downloaded)
             self.app.call_from_thread(status.update, "Downloaded successfully!")
             self.app.call_from_thread(self.query_one("#cancel-btn").__setattr__, "label", "Close")
             self.app.call_from_thread(self.query_one("#cancel-btn").__setattr__, "disabled", False)
             
         except Exception as e:
+            if destination_file.exists():
+                destination_file.unlink()
             self.app.call_from_thread(status.update, f"Error: {e}")
             self.app.call_from_thread(self.query_one("#cancel-btn").__setattr__, "disabled", False)
 
@@ -615,6 +654,10 @@ class ServeModelScreen(ModalScreen):
         status = self.query_one("#serve-status")
         if self.proc is not None and self.proc.poll() is None:
             self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
         if self.proc in _running_servers:
             _running_servers.remove(self.proc)
         self.proc = None
@@ -713,7 +756,7 @@ class LocalCoderApp(App):
 
         self.messages.append({"role": "user", "content": user_input})
         await self.chat_history.mount(ChatMessage(user_input, "user"))
-        self.chat_history.scroll_end(animate=False)
+        self.call_after_refresh(self.chat_history.scroll_end, animate=False)
         self._trim_chat_history()
 
         self.is_processing = True
@@ -784,7 +827,7 @@ class LocalCoderApp(App):
         try:
             for i in range(1, self.max_iterations + 1):
                 self.call_from_thread(self.chat_history.mount, ChatMessage(f"🤖 Agent Thinking (Step {i}/{self.max_iterations}) ...", "system"))
-                self.call_from_thread(self.chat_history.scroll_end, animate=False)
+                self.call_after_refresh(self.chat_history.scroll_end, animate=False)
 
                 stream_msg = StreamMessage(f"Assistant (Step {i})")
                 self.call_from_thread(self.chat_history.mount, stream_msg)
@@ -802,7 +845,7 @@ class LocalCoderApp(App):
 
                 if not tool_results:
                     self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))
-                    self.call_from_thread(self.chat_history.scroll_end, animate=False)
+                    self.call_after_refresh(self.chat_history.scroll_end, animate=False)
                     break
 
                 for tr in tool_results:
@@ -810,9 +853,9 @@ class LocalCoderApp(App):
                     self.call_from_thread(self.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr['path']}:\n{tr['result']}", "system"))
 
                 result_message = build_tool_result_message(tool_results)
-                self.messages.append({"role": "user", "content": result_message})
+                self.messages.append({"role": "user", "content": result_message, "is_tool_result": True})
                 compact_old_tool_results(self.messages)
-                self.call_from_thread(self.chat_history.scroll_end, animate=False)
+                self.call_after_refresh(self.chat_history.scroll_end, animate=False)
                 self.call_from_thread(self._trim_chat_history)
 
         except Exception as e:
