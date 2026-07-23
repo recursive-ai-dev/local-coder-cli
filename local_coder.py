@@ -231,10 +231,12 @@ def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
             preview_content = result
             
         console.print(Panel(Syntax(preview_content, lexer, theme="monokai", line_numbers=True), title=f"File Content: {args_info}", border_style="green"))
+    elif tool_name == "spawn_agent":
+        console.print(Panel(result, border_style="magenta", title="Subagent Execution"))
     else:
         console.print(Panel(result, border_style="cyan", title="Tool Result"))
 
-def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
+def parse_and_execute_tools(target_dir: Path, text: str, client: OpenAI = None, model: str = None, allowed_tools: list[str] = None, depth: int = 0) -> list[dict]:
     """Parse XML tags in response and execute tools in the order they appear."""
     matches = []
     
@@ -250,10 +252,19 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
     for m in re.finditer(r"<patch_file\s+path=([\"']?)(.*?)\1[^>]*>\s*<search>(.*?)</search>\s*<replace>(.*?)</replace>\s*</patch_file\s*>", text, re.DOTALL):
         matches.append((m.start(), "patch_file", m))
         
+    for m in re.finditer(r"<spawn_agent(?:[^>]*allowed_tools=([\"']?)(.*?)\1)?[^>]*>(.*?)</spawn_agent\s*>", text, re.DOTALL):
+        matches.append((m.start(), "spawn_agent", m))
+
     matches.sort(key=lambda x: x[0])
     
     results = []
     for _, tag_type, m in matches:
+        if allowed_tools is not None and tag_type not in allowed_tools:
+            res = f"Error: Tool '{tag_type}' is not permitted for this agent."
+            format_and_print_tool_call(tag_type, "N/A", res)
+            results.append({"tool": tag_type, "path": "N/A", "result": res})
+            continue
+
         if tag_type == "list_dir":
             path = m.group(1).strip()
             res = tool_list_dir(target_dir, path)
@@ -287,6 +298,21 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
             format_and_print_tool_call("patch_file", path, res)
             results.append({"tool": "patch_file", "path": path, "result": res})
             
+        elif tag_type == "spawn_agent":
+            tools_str = m.group(2) if m.group(2) else ""
+            prompt = m.group(3).strip()
+
+            res = tool_spawn_agent(
+                target_dir=target_dir,
+                client=client,
+                model=model,
+                tools_str=tools_str,
+                prompt=prompt,
+                depth=depth
+            )
+            format_and_print_tool_call("spawn_agent", "subagent", res)
+            results.append({"tool": "spawn_agent", "path": "subagent", "result": res})
+
     return results
 
 TOOL_RESULT_PREFIX = "### Execution result of "
@@ -349,7 +375,62 @@ def stream_completion(client: OpenAI, model: str, messages: list[dict], on_updat
     on_update(full_text)
     return full_text
 
+def tool_spawn_agent(target_dir: Path, client: OpenAI, model: str, tools_str: str, prompt: str, depth: int) -> str:
+    if depth >= 2:
+        return "Error: Maximum subagent recursion depth (2) reached."
+
+    if not client or not model:
+        return "Error: Cannot spawn subagent (LLM client/model missing)."
+
+    allowed_tools = [t.strip() for t in tools_str.split(",")] if tools_str else None
+    if allowed_tools and "" in allowed_tools:
+        allowed_tools.remove("")
+
+    system_prompt = "You are a subagent helping with a specific task. Use XML tags to call tools (e.g., <read_file>path</read_file>, <write_file path=\"path\">content</write_file>, <list_dir>path</list_dir>)."
+    if allowed_tools:
+        system_prompt += f" You are only allowed to use the following tools: {', '.join(allowed_tools)}."
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt}
+    ]
+
+    console.print(f"\n[bold magenta]Subagent Spawned (Depth {depth+1})[/bold magenta]")
+
+    max_iters = 5
+    for i in range(1, max_iters + 1):
+        assistant_response = ""
+        try:
+            def on_update(text):
+                pass # Silent in console for subagent? Or print simplified.
+
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.2,
+                stream=False,
+                timeout=120.0
+            )
+            assistant_response = response.choices[0].message.content or ""
+        except Exception as e:
+            return f"Subagent error: {e}"
+
+        messages.append({"role": "assistant", "content": assistant_response})
+        tool_results = parse_and_execute_tools(target_dir, assistant_response, client=client, model=model, allowed_tools=allowed_tools, depth=depth+1)
+
+        if not tool_results:
+            break
+
+        result_message = build_tool_result_message(tool_results)
+        messages.append({"role": "user", "content": result_message, "is_tool_result": True})
+        compact_old_tool_results(messages)
+
+    # Summarize what the subagent did
+    # For now, just return the last assistant response or a summary.
+    return f"Subagent execution completed. Final response:\n{assistant_response}"
+
 def build_tool_result_message(tool_results: list[dict]) -> str:
+
     parts = [
         f"### Execution result of {tr['tool']} on '{tr['path']}':\n{tr['result']}\n"
         for tr in tool_results
@@ -382,7 +463,7 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
 
         messages.append({"role": "assistant", "content": assistant_response})
 
-        tool_results = parse_and_execute_tools(target_dir, assistant_response)
+        tool_results = parse_and_execute_tools(target_dir, assistant_response, client=client, model=model)
 
         if not tool_results:
             console.print("[bold green]✔ No tools triggered or task complete.[/bold green]")
@@ -841,7 +922,7 @@ class LocalCoderApp(App):
                 self.messages.append({"role": "assistant", "content": assistant_response})
 
                 # Execute tools
-                tool_results = parse_and_execute_tools(self.target_dir, assistant_response)
+                tool_results = parse_and_execute_tools(self.target_dir, assistant_response, client=self.client, model=self.model)
 
                 if not tool_results:
                     self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))

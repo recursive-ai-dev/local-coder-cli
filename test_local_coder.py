@@ -114,7 +114,46 @@ class TestLocalCoder(unittest.TestCase):
         self.assertTrue(m_dir.exists())
         self.assertTrue(m_dir.is_dir())
 
+    def test_subagent_tool_restriction(self):
+        # Tools allowed: read_file
+        # Trying to use write_file
+        llm_response = "<write_file path=\"not_allowed.txt\">content</write_file>"
+        results = local_coder.parse_and_execute_tools(self.test_dir, llm_response, allowed_tools=["read_file"])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "write_file")
+        self.assertIn("Error: Tool 'write_file' is not permitted", results[0]["result"])
+
+        # Check file wasn't written
+        file_path = self.test_dir / "not_allowed.txt"
+        self.assertFalse(file_path.exists())
+
+    def test_subagent_recursion_depth_limit(self):
+        class DummyClient:
+            pass
+
+        client = DummyClient()
+        model = "dummy"
+
+        res = local_coder.tool_spawn_agent(
+            target_dir=self.test_dir,
+            client=client,
+            model=model,
+            tools_str="read_file",
+            prompt="Hello",
+            depth=2
+        )
+        self.assertEqual(res, "Error: Maximum subagent recursion depth (2) reached.")
+
+
+    def test_subagent_tag_parsing(self):
+        llm_response = "<spawn_agent allowed_tools=\"read_file\">Find the secret file</spawn_agent>"
+        results = local_coder.parse_and_execute_tools(self.test_dir, llm_response, client=None, model=None, depth=2)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "spawn_agent")
+        # should fail due to depth
+        self.assertIn("Error: Maximum subagent recursion depth", results[0]["result"])
+
+
 if __name__ == "__main__":
     unittest.main()
-
-
