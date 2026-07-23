@@ -114,6 +114,39 @@ class TestLocalCoder(unittest.TestCase):
         self.assertTrue(m_dir.exists())
         self.assertTrue(m_dir.is_dir())
 
+    def test_console_repl_slash_commands(self):
+        import io
+        import sys
+
+        # Capture console output
+        original_stdout = sys.stdout
+        sys.stdout = captured_output = io.StringIO()
+
+        # Mock input
+        original_input = local_coder.console.input
+
+        inputs = iter(["/tools", "/agents", "/help", "/unknown", "/exit"])
+        def mock_input(*args, **kwargs):
+            return next(inputs)
+
+        local_coder.console.input = mock_input
+
+        try:
+            local_coder.run_console_repl(None, "test-model", self.test_dir, [{"role": "system", "content": "sys prompt"}], False, 10)
+        except StopIteration:
+            pass # In case we run out of inputs before /exit
+        finally:
+            sys.stdout = original_stdout
+            local_coder.console.input = original_input
+
+        output = captured_output.getvalue()
+
+        # Check that expected texts are in the output
+        self.assertIn("Available Tool Tags", output)
+        self.assertIn("Available Subagents", output)
+        self.assertIn("Available Commands", output)
+        self.assertIn("Command /unknown not supported", output)
+
 if __name__ == "__main__":
     unittest.main()
 

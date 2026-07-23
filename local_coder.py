@@ -785,6 +785,25 @@ class LocalCoderApp(App):
             self.push_screen(DownloadModelScreen())
         elif cmd == "/serve":
             self.push_screen(ServeModelScreen())
+        elif cmd == "/tools":
+            tools_info = (
+                "**Available Tool Tags:**\n"
+                "- `<list_dir path=\"...\">`: List files in a directory\n"
+                "- `<read_file>path</read_file>`: Read file content\n"
+                "- `<write_file path=\"...\">content</write_file>`: Create/overwrite a file\n"
+                "- `<patch_file path=\"...\"><search>...</search><replace>...</replace></patch_file>`: Edit a file"
+            )
+            await self.chat_history.mount(ChatMessage(tools_info, "system"))
+            self.chat_history.scroll_end(animate=False)
+        elif cmd == "/agents":
+            agents_info = (
+                "**Available Subagents:**\n"
+                "*(Note: Subagent routing logic is currently a placeholder for task 3)*\n"
+                "- `Code Expert`: Specialized in writing and reviewing code\n"
+                "- `File Manager`: Specialized in managing the file system"
+            )
+            await self.chat_history.mount(ChatMessage(agents_info, "system"))
+            self.chat_history.scroll_end(animate=False)
         elif cmd == "/help":
             help_text = (
                 "**Available Commands:**\n"
@@ -793,12 +812,14 @@ class LocalCoderApp(App):
                 "- `/serve`: Serve a downloaded model using llama-server\n"
                 "- `/dir`: List files in the target directory\n"
                 "- `/clear`: Clear history or screen\n"
+                "- `/tools`: List available tool tags\n"
+                "- `/agents`: List configured subagents\n"
                 "- `/exit` or `/quit`: Exit the interactive session"
             )
             await self.chat_history.mount(ChatMessage(help_text, "system"))
             self.chat_history.scroll_end(animate=False)
         else:
-            await self.chat_history.mount(ChatMessage(f"Command {cmd} not supported in TUI yet. Supported: /exit, /clear, /dir, /models, /serve, /help", "system"))
+            await self.chat_history.mount(ChatMessage(f"Command {cmd} not supported in TUI yet. Supported: /exit, /clear, /dir, /models, /serve, /tools, /agents, /help", "system"))
             self.chat_history.scroll_end(animate=False)
 
     @work(thread=True)
@@ -864,6 +885,68 @@ class LocalCoderApp(App):
             self.is_processing = False
 
 
+def run_console_repl(client: OpenAI, model: str, target_dir: Path, messages: list[dict], agent_mode: bool, max_iterations: int):
+    console.print(Panel(f"[bold green]Target Directory:[/bold green] {target_dir.resolve()}\n[bold green]Model:[/bold green] {model}\n[bold green]Agent Mode:[/bold green] {agent_mode}", title="Console REPL Started"))
+    console.print("Type your instruction below. Use [bold]/help[/bold] for available commands.")
+
+    while True:
+        try:
+            user_input = console.input("\n[bold cyan]You:[/bold cyan] ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[bold yellow]Exiting...[/bold yellow]")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.startswith("/"):
+            cmd = user_input.lower().split()[0]
+            if cmd in ["/exit", "/quit"]:
+                console.print("[bold yellow]Exiting...[/bold yellow]")
+                break
+            elif cmd == "/clear":
+                sys_prompt = messages[0]
+                messages.clear()
+                messages.append(sys_prompt)
+                console.print("[bold green]History cleared. System prompt retained.[/bold green]")
+            elif cmd == "/tools":
+                tools_info = (
+                    "**Available Tool Tags:**\n"
+                    "- `<list_dir path=\"...\">`: List files in a directory\n"
+                    "- `<read_file>path</read_file>`: Read file content\n"
+                    "- `<write_file path=\"...\">content</write_file>`: Create/overwrite a file\n"
+                    "- `<patch_file path=\"...\"><search>...</search><replace>...</replace></patch_file>`: Edit a file"
+                )
+                console.print(Panel(Markdown(tools_info), title="Tools", border_style="blue"))
+            elif cmd == "/agents":
+                agents_info = (
+                    "**Available Subagents:**\n"
+                    "*(Note: Subagent routing logic is currently a placeholder for task 3)*\n"
+                    "- `Code Expert`: Specialized in writing and reviewing code\n"
+                    "- `File Manager`: Specialized in managing the file system"
+                )
+                console.print(Panel(Markdown(agents_info), title="Agents", border_style="blue"))
+            elif cmd == "/help":
+                help_text = (
+                    "**Available Commands:**\n"
+                    "- `/help`: Show this help message\n"
+                    "- `/clear`: Clear message history (retains system prompt)\n"
+                    "- `/tools`: List available tool tags\n"
+                    "- `/agents`: List configured subagents\n"
+                    "- `/exit` or `/quit`: Exit the REPL"
+                )
+                console.print(Panel(Markdown(help_text), title="Help", border_style="blue"))
+            else:
+                console.print(f"[bold red]Command {cmd} not supported in Console REPL. Supported: /help, /clear, /tools, /agents, /exit[/bold red]")
+            continue
+
+        messages.append({"role": "user", "content": user_input})
+        if agent_mode:
+            run_agent_loop(client, model, target_dir, messages, max_iterations)
+        else:
+            run_single_prompt(client, model, messages)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Local Coder - Beautiful CLI coding agent.")
     parser.add_argument("--provider", choices=["lmstudio", "llamacpp", "custom"], help="Choose the preset local LLM provider")
@@ -874,7 +957,8 @@ def main():
     parser.add_argument("--system-prompt", help="Path to custom system prompt txt file")
     parser.add_argument("--agent", action="store_true", help="Enable autonomous agent loop with filesystem tools")
     parser.add_argument("--max-iterations", type=int, default=10, help="Maximum number of loop iterations for agent mode")
-    parser.add_argument("-i", "--interactive", action="store_true", help="Force launch the interactive REPL shell")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Force launch the interactive REPL shell (TUI)")
+    parser.add_argument("--console", action="store_true", help="Force launch the interactive REPL shell (Console sync mode)")
     parser.add_argument("prompt", nargs="?", help="The programming task / instruction for the LLM")
     
     args = parser.parse_args()
@@ -911,14 +995,17 @@ def main():
     
     messages = [{"role": "system", "content": system_prompt_content}]
     
-    is_interactive = args.interactive or (not args.prompt)
+    is_interactive = args.interactive or args.console or (not args.prompt)
     
 
     if is_interactive:
-        global TUI_MODE
-        TUI_MODE = True
-        app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations)
-        app.run()
+        if args.console:
+            run_console_repl(client, model, target_dir, messages, args.agent, args.max_iterations)
+        else:
+            global TUI_MODE
+            TUI_MODE = True
+            app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations)
+            app.run()
     else:
         messages.append({"role": "user", "content": args.prompt})
         console.print(Panel(f"[bold green]Target Directory:[/bold green] {target_dir.resolve()}\n[bold green]Provider:[/bold green] {provider} ({api_url})\n[bold green]Task:[/bold green] {args.prompt}", title="Agent Run Started"))
