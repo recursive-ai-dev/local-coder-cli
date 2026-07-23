@@ -81,6 +81,9 @@ def get_safe_path(target_dir: Path, subpath_str: str) -> Path:
     """Resolve subpath safely, ensuring it is within the target directory."""
     target_dir = target_dir.resolve()
     subpath_str = subpath_str.strip()
+    # Normalize Windows backslashes to forward slashes for safer handling on POSIX
+    subpath_str = subpath_str.replace("\\", "/")
+
     if subpath_str.startswith("/") or Path(subpath_str).is_absolute():
         raise ValueError(f"Security error: Absolute path '{subpath_str}' is not allowed.")
     
@@ -250,10 +253,20 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
     for m in re.finditer(r"<patch_file\s+path=([\"']?)(.*?)\1[^>]*>\s*<search>(.*?)</search>\s*<replace>(.*?)</replace>\s*</patch_file\s*>", text, re.DOTALL):
         matches.append((m.start(), "patch_file", m))
         
-    matches.sort(key=lambda x: x[0])
+    # Store match object, end index, and tag type
+    all_matches = []
+    for start, tag_type, m in matches:
+        all_matches.append((start, m.end(), tag_type, m))
+
+    all_matches.sort(key=lambda x: x[0])
     
     results = []
-    for _, tag_type, m in matches:
+    last_end = 0
+
+    for start, end, tag_type, m in all_matches:
+        if start < last_end:
+            continue
+        last_end = end
         if tag_type == "list_dir":
             path = m.group(1).strip()
             res = tool_list_dir(target_dir, path)

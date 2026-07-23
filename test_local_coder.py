@@ -20,10 +20,27 @@ class TestLocalCoder(unittest.TestCase):
         
         # Path escape detection (security constraint)
         with self.assertRaises(ValueError):
-            local_coder.get_safe_path(self.test_dir, "../escaped.txt")
+            local_coder.get_safe_path(self.test_dir, "../../etc/passwd")
             
         with self.assertRaises(ValueError):
             local_coder.get_safe_path(self.test_dir, "/absolute/escaped.txt")
+
+        # Windows-style sequence escape attempt
+        with self.assertRaises(ValueError):
+            local_coder.get_safe_path(self.test_dir, "..\\..\\etc\\passwd")
+
+        # Symlink escape attempt
+        symlink_dir = self.test_dir / "symlink_dir"
+        symlink_dir.mkdir()
+        symlink_file = symlink_dir / "link"
+        try:
+            symlink_file.symlink_to("/etc/passwd")
+        except Exception:
+            pass # ignore symlink failure if no permission
+        else:
+            with self.assertRaises(ValueError):
+                # Wait, get_safe_path just resolves. It resolves symlinks, so it points out of dir
+                local_coder.get_safe_path(self.test_dir, "symlink_dir/link")
 
     def test_tool_write_and_read(self):
         # Write file
@@ -97,6 +114,54 @@ class TestLocalCoder(unittest.TestCase):
         self.assertEqual(results[1]["tool"], "read_file")
         self.assertEqual(results[1]["path"], "script.py")
         self.assertEqual(results[1]["result"], 'print("Hello CLI")\n')
+
+    def test_multiple_tool_calls_ordering(self):
+        import textwrap
+        llm_response = textwrap.dedent("""\
+            <read_file>1.txt</read_file>
+            <list_dir>.</list_dir>
+            <write_file path="2.txt">content</write_file>
+            <patch_file path="3.txt">
+            <search>foo</search>
+            <replace>bar</replace>
+            </patch_file>
+        """)
+        results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+        self.assertEqual(len(results), 4)
+        self.assertEqual(results[0]["tool"], "read_file")
+        self.assertEqual(results[1]["tool"], "list_dir")
+        self.assertEqual(results[2]["tool"], "write_file")
+        self.assertEqual(results[3]["tool"], "patch_file")
+
+    def test_malformed_tags_ignored(self):
+        llm_response = """
+            Here is a malformed tag:
+            <write_file path="test.txt">
+            Content without closing tag
+
+            And an unclosed read:
+            <read_file>missing_close.txt
+        """
+        results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+        self.assertEqual(len(results), 0)
+
+    def test_nested_tags_ignored(self):
+        # Tags inside the body of a write_file should be treated as literal content
+        llm_response = """
+            <write_file path="nested.xml">
+            <read_file>some_file.txt</read_file>
+            <list_dir>.</list_dir>
+            </write_file>
+        """
+        results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+        # Should only execute write_file once
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "write_file")
+        self.assertEqual(results[0]["path"], "nested.xml")
+
+        content = (self.test_dir / "nested.xml").read_text()
+        self.assertIn("<read_file>some_file.txt</read_file>", content)
+        self.assertIn("<list_dir>.</list_dir>", content)
 
     def test_provider_detection_fallback(self):
         # When no endpoints are active, detect_provider returns (None, None)
