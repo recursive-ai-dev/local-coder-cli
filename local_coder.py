@@ -304,7 +304,6 @@ def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
     else:
         console.print(Panel(result, border_style="cyan", title="Tool Result"))
 
-def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str] = None, subagent_runner=None) -> list[dict]:
 def ask_user_confirmation(tool_name: str, path: str, preview: str) -> bool:
     if _YOLO_MODE:
         return True
@@ -328,7 +327,7 @@ def ask_user_confirmation(tool_name: str, path: str, preview: str) -> bool:
     result_event.wait()
     return user_decision[0] if user_decision else False
 
-def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
+def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str] = None, subagent_runner=None) -> list[dict]:
     """Parse XML tags in response and execute tools in the order they appear."""
     matches = []
     
