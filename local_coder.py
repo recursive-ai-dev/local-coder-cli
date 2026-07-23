@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import time
+import difflib
 import sys
 import re
 import argparse
@@ -175,6 +176,16 @@ def tool_patch_file(target_dir: Path, path: str, search: str, replace: str) -> s
                 new_content = new_content.replace("\n", "\r\n")
             safe_path.write_text(new_content, encoding="utf-8")
             os.chmod(safe_path, orig_mode)
+
+            diff_lines = list(difflib.unified_diff(
+                original_content.splitlines(keepends=True),
+                new_content.splitlines(keepends=True),
+                fromfile=path,
+                tofile=path
+            ))
+            diff_text = "".join(diff_lines)
+            if diff_text:
+                message += f"\n\n```diff\n{diff_text}```"
             return message
 
         idx = original_content.find(search)
@@ -248,9 +259,11 @@ def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
             else:
                 table.add_row("", line)
         console.print(table)
-    elif tool_name in ["read_file", "write_file"]:
+    elif tool_name in ["read_file", "write_file", "patch_file"]:
         lexer = "python"
-        if args_info.endswith(".json"): lexer = "json"
+        if tool_name == "patch_file":
+            lexer = "diff"
+        elif args_info.endswith(".json"): lexer = "json"
         elif args_info.endswith(".md"): lexer = "markdown"
         elif args_info.endswith(".html"): lexer = "html"
         elif args_info.endswith(".css"): lexer = "css"
@@ -263,7 +276,8 @@ def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
         else:
             preview_content = result
             
-        console.print(Panel(Syntax(preview_content, lexer, theme="monokai", line_numbers=True), title=f"File Content: {args_info}", border_style="green"))
+        line_numbers = tool_name != "patch_file"
+        console.print(Panel(Syntax(preview_content, lexer, theme="monokai", line_numbers=line_numbers), title=f"File Content: {args_info}", border_style="green"))
     else:
         console.print(Panel(result, border_style="cyan", title="Tool Result"))
 
@@ -805,10 +819,11 @@ class ServeModelScreen(ModalScreen):
 
 
 class ChatMessage(Static):
-    def __init__(self, text: str, role: str):
+    def __init__(self, text: str, role: str, is_diff: bool = False):
         super().__init__()
         self.text = text
         self.role = role
+        self.is_diff = is_diff
 
     def render(self):
         if self.role == "user":
@@ -816,7 +831,8 @@ class ChatMessage(Static):
         elif self.role == "assistant":
             return Panel(Markdown(self.text), title="Assistant", border_style="blue", expand=False)
         else: # System or tool
-            return Panel(self.text, title=self.role.capitalize(), border_style="yellow", expand=False)
+            content = Syntax(self.text, "diff", theme="monokai", line_numbers=False) if self.is_diff else self.text
+            return Panel(content, title=self.role.capitalize(), border_style="yellow", expand=False)
 
 class StreamMessage(Static):
     """A chat widget that accumulates streamed text and re-renders it on demand."""
@@ -986,7 +1002,8 @@ class LocalCoderApp(App):
 
                 for tr in tool_results:
                     # Show tool result in UI
-                    self.call_from_thread(self.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr['path']}:\n{tr['result']}", "system"))
+                    is_diff = tr['tool'] == 'patch_file'
+                    self.call_from_thread(self.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr['path']}:\n{tr['result']}", "system", is_diff=is_diff))
 
                 result_message = build_tool_result_message(tool_results)
                 self.messages.append({"role": "user", "content": result_message, "is_tool_result": True})

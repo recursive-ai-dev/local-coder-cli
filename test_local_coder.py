@@ -66,6 +66,8 @@ class TestLocalCoder(unittest.TestCase):
             "def sub(a, b):\n    # Subtract b from a\n    return a - b"
         )
         self.assertIn("Successfully applied patch", patch_res)
+        self.assertIn("--- math_utils.py", patch_res)
+        self.assertIn("+++ math_utils.py", patch_res)
         
         patched_content = local_coder.tool_read_file(self.test_dir, "math_utils.py")
         self.assertIn("# Subtract b from a", patched_content)
