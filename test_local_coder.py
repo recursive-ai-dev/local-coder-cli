@@ -114,7 +114,65 @@ class TestLocalCoder(unittest.TestCase):
         self.assertTrue(m_dir.exists())
         self.assertTrue(m_dir.is_dir())
 
+    def test_run_agent_loop_max_history(self):
+        messages = [{"role": "system", "content": "Sys prompt"}]
+        for _ in range(30):
+            messages.append({"role": "user", "content": "Msg"})
+
+        class FakeClient:
+            pass
+
+        # Fake stream_completion that just returns "Agent thought"
+        import sys
+        original_stream = local_coder.stream_completion
+        original_parse = local_coder.parse_and_execute_tools
+        try:
+            local_coder.stream_completion = lambda c, m, msgs, cb: "Agent thought"
+            local_coder.parse_and_execute_tools = lambda d, r: [{"tool": "read_file", "path": "x", "result": "content"}]
+            local_coder.run_agent_loop(FakeClient(), "m", self.test_dir, messages, max_iterations=5, max_history=10)
+            self.assertLessEqual(len(messages), 10)
+            self.assertEqual(messages[0]["content"], "Sys prompt")
+        finally:
+            local_coder.stream_completion = original_stream
+            local_coder.parse_and_execute_tools = original_parse
+
+    def test_trim_messages_context(self):
+        # Initial context with system prompt and some turns
+        messages = [{"role": "system", "content": "You are a helpful bot."}]
+        for i in range(10):
+            messages.append({"role": "user", "content": f"User {i}"})
+            messages.append({"role": "assistant", "content": f"Bot {i}"})
+
+        # We have 1 system + 20 message pairs = 21 items.
+        self.assertEqual(len(messages), 21)
+
+        # Test trimming to a max of 5
+        local_coder.trim_messages_context(messages, max_history=5)
+
+        # Expect length to drop to 5
+        self.assertEqual(len(messages), 5)
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[0]["content"], "You are a helpful bot.")
+
+        # The remaining 4 items should be the latest ones.
+        self.assertEqual(messages[-4]["content"], "User 8")
+        self.assertEqual(messages[-3]["content"], "Bot 8")
+        self.assertEqual(messages[-2]["content"], "User 9")
+        self.assertEqual(messages[-1]["content"], "Bot 9")
+
+    def test_trim_messages_context_preserves_minimum_length(self):
+        messages = [{"role": "system", "content": "You are a helpful bot."},
+                    {"role": "user", "content": "A"},
+                    {"role": "assistant", "content": "B"},
+                    {"role": "user", "content": "C"},
+                    {"role": "assistant", "content": "D"}]
+
+        # Trimming with an impossibly small max history should clamp to min 3
+        local_coder.trim_messages_context(messages, max_history=2)
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[1]["content"], "C")
+        self.assertEqual(messages[2]["content"], "D")
+
 if __name__ == "__main__":
     unittest.main()
-
-

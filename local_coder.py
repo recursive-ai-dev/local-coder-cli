@@ -291,6 +291,20 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
 
 TOOL_RESULT_PREFIX = "### Execution result of "
 
+def trim_messages_context(messages: list[dict], max_history: int = 20) -> None:
+    """Trim the actual list of messages to prevent LLM context limit errors.
+
+    Drops the oldest turns in pairs to preserve role alternation where possible,
+    while always keeping the system prompt at messages[0].
+    """
+    if max_history < 3:
+        max_history = 3
+
+    while len(messages) > max_history and len(messages) > 3:
+        # Preserve messages[0] (system prompt). Pop index 1 and 2 (which becomes 1 after first pop)
+        messages.pop(1)
+        messages.pop(1)
+
 def compact_old_tool_results(messages: list[dict], keep_last: int = 1) -> None:
     """Replace verbatim tool-result content in older turns with a short placeholder.
 
@@ -356,7 +370,7 @@ def build_tool_result_message(tool_results: list[dict]) -> str:
     ]
     return "\n".join(parts)
 
-def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int):
+def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int, max_history: int = 20):
     """Executes the agentic reasoning & execution loop with live updates."""
     for i in range(1, max_iterations + 1):
         console.print(f"\n[bold blue]🤖 Agent Thinking (Step {i}/{max_iterations}) ...[/bold blue]")
@@ -392,6 +406,7 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
         console.print(f"[bold cyan]Sending tool results back to LLM...[/bold cyan]")
         messages.append({"role": "user", "content": result_message, "is_tool_result": True})
         compact_old_tool_results(messages)
+        trim_messages_context(messages, max_history)
 
     return messages
 
@@ -708,7 +723,7 @@ class LocalCoderApp(App):
     }
     """
     
-    def __init__(self, client, model, target_dir, messages, agent_mode, max_iterations):
+    def __init__(self, client, model, target_dir, messages, agent_mode, max_iterations, max_history=20):
         super().__init__()
         self.client = client
         self.model = model
@@ -716,6 +731,7 @@ class LocalCoderApp(App):
         self.messages = messages
         self.agent_mode = agent_mode
         self.max_iterations = max_iterations
+        self.max_history = max_history
         self.is_processing = False
 
     def compose(self) -> ComposeResult:
@@ -855,6 +871,7 @@ class LocalCoderApp(App):
                 result_message = build_tool_result_message(tool_results)
                 self.messages.append({"role": "user", "content": result_message, "is_tool_result": True})
                 compact_old_tool_results(self.messages)
+                trim_messages_context(self.messages, self.max_history)
                 self.call_after_refresh(self.chat_history.scroll_end, animate=False)
                 self.call_from_thread(self._trim_chat_history)
 
@@ -874,6 +891,7 @@ def main():
     parser.add_argument("--system-prompt", help="Path to custom system prompt txt file")
     parser.add_argument("--agent", action="store_true", help="Enable autonomous agent loop with filesystem tools")
     parser.add_argument("--max-iterations", type=int, default=10, help="Maximum number of loop iterations for agent mode")
+    parser.add_argument("--max-history", type=int, default=20, help="Maximum number of messages to keep in context (rolling window)")
     parser.add_argument("-i", "--interactive", action="store_true", help="Force launch the interactive REPL shell")
     parser.add_argument("prompt", nargs="?", help="The programming task / instruction for the LLM")
     
@@ -917,13 +935,13 @@ def main():
     if is_interactive:
         global TUI_MODE
         TUI_MODE = True
-        app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations)
+        app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations, getattr(args, "max_history", 20))
         app.run()
     else:
         messages.append({"role": "user", "content": args.prompt})
         console.print(Panel(f"[bold green]Target Directory:[/bold green] {target_dir.resolve()}\n[bold green]Provider:[/bold green] {provider} ({api_url})\n[bold green]Task:[/bold green] {args.prompt}", title="Agent Run Started"))
         if args.agent:
-            run_agent_loop(client, model, target_dir, messages, args.max_iterations)
+            run_agent_loop(client, model, target_dir, messages, args.max_iterations, args.max_history)
         else:
             run_single_prompt(client, model, messages)
 
