@@ -114,7 +114,50 @@ class TestLocalCoder(unittest.TestCase):
         self.assertTrue(m_dir.exists())
         self.assertTrue(m_dir.is_dir())
 
+
+
+    def test_tool_run_command_auto_approve(self):
+        # We need to monkeypatch AUTO_APPROVE to True
+        original_approve = local_coder.AUTO_APPROVE
+        local_coder.AUTO_APPROVE = True
+        try:
+            res = local_coder.tool_run_command(self.test_dir, "echo 'hello world'")
+            self.assertIn("hello world", res)
+            self.assertIn("Exit code: 0", res)
+        finally:
+            local_coder.AUTO_APPROVE = original_approve
+
+    def test_tool_run_command_confirmation(self):
+        original_approve = local_coder.AUTO_APPROVE
+        local_coder.AUTO_APPROVE = False
+        try:
+            # No callback provided -> Error
+            res = local_coder.tool_run_command(self.test_dir, "echo 'hello world'")
+            self.assertIn("Error: Command execution requires user confirmation", res)
+
+            # Callback denies -> Error
+            res_deny = local_coder.tool_run_command(self.test_dir, "echo 'hello'", confirm_callback=lambda msg: False)
+            self.assertIn("Error: User denied command execution", res_deny)
+
+            # Callback approves -> Success
+            res_approve = local_coder.tool_run_command(self.test_dir, "echo 'approved'", confirm_callback=lambda msg: True)
+            self.assertIn("approved", res_approve)
+            self.assertIn("Exit code: 0", res_approve)
+        finally:
+            local_coder.AUTO_APPROVE = original_approve
+
+    def test_parse_and_execute_run_command(self):
+        import textwrap
+        llm_response = textwrap.dedent("""\
+            Let's execute this.
+            <run_command>echo 'parsed successfully'</run_command>
+        """)
+
+        # Test with approval
+        results = local_coder.parse_and_execute_tools(self.test_dir, llm_response, confirm_callback=lambda msg: True)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "run_command")
+        self.assertIn("parsed successfully", results[0]["result"])
+
 if __name__ == "__main__":
     unittest.main()
-
-

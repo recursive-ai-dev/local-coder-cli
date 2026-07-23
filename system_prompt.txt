@@ -35,6 +35,12 @@ To perform actions, you MUST use the following XML tags in your response. You ca
    </replace>
    </patch_file>
 
+
+5. **Run Command**
+   Executes a shell command in the target directory. Wait for completion up to 30s.
+   Syntax:
+   <run_command>your bash command here</run_command>
+
 ### Guidelines:
 - Analyze the user request and explore the directory first if needed.
 - Write clean, well-structured code.

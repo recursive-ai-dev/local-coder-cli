@@ -29,6 +29,7 @@ from textual import work
 
 console = Console()
 TUI_MODE = False
+AUTO_APPROVE = False
 
 MODELS_PRESETS = {
     "1": {
@@ -198,6 +199,55 @@ def tool_patch_file(target_dir: Path, path: str, search: str, replace: str) -> s
     except Exception as e:
         return f"Error patching file: {str(e)}"
 
+
+def tool_run_command(target_dir: Path, command: str, confirm_callback=None) -> str:
+    try:
+        target_dir = target_dir.resolve()
+        # Security constraints are applied by cwd=target_dir but command could theoretically still reference other places.
+        # We rely on user confirmation for the final gate.
+
+        if not AUTO_APPROVE:
+            prompt_msg = f"Agent wants to run shell command:\n{command}\n\nAllow execution?"
+            if confirm_callback is None:
+                return f"Error: Command execution requires user confirmation, but no interactive callback is available. Run with --yolo to auto-approve."
+
+            is_approved = confirm_callback(prompt_msg)
+            if not is_approved:
+                return "Error: User denied command execution."
+
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=str(target_dir),
+                capture_output=True,
+                text=True,
+                timeout=30.0
+            )
+
+            output = result.stdout
+            if result.stderr:
+                if output:
+                    output += "\n"
+                output += "--- STDERR ---\n" + result.stderr
+
+            if not output.strip():
+                output = "Command executed successfully with no output."
+
+            lines = output.splitlines()
+            if len(lines) > 200:
+                hidden = len(lines) - 200
+                lines = lines[:200]
+                lines.append(f"... [{hidden} more lines hidden]")
+                output = "\n".join(lines)
+
+            return f"Exit code: {result.returncode}\nOutput:\n{output}"
+
+        except subprocess.TimeoutExpired:
+            return "Error: Command timed out after 30 seconds."
+    except Exception as e:
+        return f"Error executing command: {str(e)}"
+
 def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
     if TUI_MODE: return
     """Print the tool execution beautifully in the console."""
@@ -231,10 +281,12 @@ def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
             preview_content = result
             
         console.print(Panel(Syntax(preview_content, lexer, theme="monokai", line_numbers=True), title=f"File Content: {args_info}", border_style="green"))
+    elif tool_name == "run_command":
+        console.print(Panel(result, border_style="red", title="Command Output"))
     else:
         console.print(Panel(result, border_style="cyan", title="Tool Result"))
 
-def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
+def parse_and_execute_tools(target_dir: Path, text: str, confirm_callback=None) -> list[dict]:
     """Parse XML tags in response and execute tools in the order they appear."""
     matches = []
     
@@ -250,6 +302,9 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
     for m in re.finditer(r"<patch_file\s+path=([\"']?)(.*?)\1[^>]*>\s*<search>(.*?)</search>\s*<replace>(.*?)</replace>\s*</patch_file\s*>", text, re.DOTALL):
         matches.append((m.start(), "patch_file", m))
         
+    for m in re.finditer(r"<run_command>(.*?)</run_command\s*>", text, re.DOTALL):
+        matches.append((m.start(), "run_command", m))
+
     matches.sort(key=lambda x: x[0])
     
     results = []
@@ -287,6 +342,12 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
             format_and_print_tool_call("patch_file", path, res)
             results.append({"tool": "patch_file", "path": path, "result": res})
             
+        elif tag_type == "run_command":
+            command = m.group(1).strip()
+            res = tool_run_command(target_dir, command, confirm_callback)
+            format_and_print_tool_call("run_command", command, res)
+            results.append({"tool": "run_command", "path": ".", "result": res})
+
     return results
 
 TOOL_RESULT_PREFIX = "### Execution result of "
@@ -357,6 +418,10 @@ def build_tool_result_message(tool_results: list[dict]) -> str:
     return "\n".join(parts)
 
 def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int):
+    def console_confirm(prompt_msg: str) -> bool:
+        from rich.prompt import Confirm
+        return Confirm.ask(prompt_msg, default=False)
+
     """Executes the agentic reasoning & execution loop with live updates."""
     for i in range(1, max_iterations + 1):
         console.print(f"\n[bold blue]🤖 Agent Thinking (Step {i}/{max_iterations}) ...[/bold blue]")
@@ -382,7 +447,7 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
 
         messages.append({"role": "assistant", "content": assistant_response})
 
-        tool_results = parse_and_execute_tools(target_dir, assistant_response)
+        tool_results = parse_and_execute_tools(target_dir, assistant_response, confirm_callback=console_confirm)
 
         if not tool_results:
             console.print("[bold green]✔ No tools triggered or task complete.[/bold green]")
@@ -473,6 +538,41 @@ def is_port_in_use(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.3)
         return s.connect_ex(("localhost", port)) == 0
+
+
+import threading
+
+class ConfirmScreen(ModalScreen[bool]):
+    CSS = """
+    ConfirmScreen {
+        align: center middle;
+    }
+    #confirm-dialog {
+        padding: 1 2;
+        width: 60;
+        height: auto;
+        border: thick $background 80%;
+        background: $surface;
+    }
+    """
+
+    def __init__(self, message: str, **kwargs):
+        super().__init__(**kwargs)
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Label("⚠️ Security Confirmation Requested ⚠️", style="bold red")
+            yield Static(self.message, id="confirm-msg")
+            with Horizontal():
+                yield Button("Approve", variant="success", id="approve-btn")
+                yield Button("Deny", variant="error", id="deny-btn")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "approve-btn":
+            self.dismiss(True)
+        elif event.button.id == "deny-btn":
+            self.dismiss(False)
 
 class DownloadModelScreen(ModalScreen):
     CSS = """
@@ -841,7 +941,21 @@ class LocalCoderApp(App):
                 self.messages.append({"role": "assistant", "content": assistant_response})
 
                 # Execute tools
-                tool_results = parse_and_execute_tools(self.target_dir, assistant_response)
+
+                def tui_confirm(prompt_msg: str) -> bool:
+                    event = threading.Event()
+                    result = [False]
+
+                    def callback(res):
+                        if res is not None:
+                            result[0] = res
+                        event.set()
+
+                    self.call_from_thread(self.app.push_screen, ConfirmScreen(prompt_msg), callback)
+                    event.wait()
+                    return result[0]
+
+                tool_results = parse_and_execute_tools(self.target_dir, assistant_response, confirm_callback=tui_confirm)
 
                 if not tool_results:
                     self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))
@@ -874,6 +988,7 @@ def main():
     parser.add_argument("--system-prompt", help="Path to custom system prompt txt file")
     parser.add_argument("--agent", action="store_true", help="Enable autonomous agent loop with filesystem tools")
     parser.add_argument("--max-iterations", type=int, default=10, help="Maximum number of loop iterations for agent mode")
+    parser.add_argument("--yolo", "--auto-approve", action="store_true", dest="auto_approve", help="Auto-approve dangerous commands (like run_command) without asking")
     parser.add_argument("-i", "--interactive", action="store_true", help="Force launch the interactive REPL shell")
     parser.add_argument("prompt", nargs="?", help="The programming task / instruction for the LLM")
     
@@ -913,6 +1028,9 @@ def main():
     
     is_interactive = args.interactive or (not args.prompt)
     
+    global AUTO_APPROVE
+    AUTO_APPROVE = args.auto_approve
+
 
     if is_interactive:
         global TUI_MODE
