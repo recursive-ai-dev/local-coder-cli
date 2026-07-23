@@ -252,6 +252,25 @@ class TestLocalCoder(unittest.TestCase):
         self.assertTrue(m_dir.exists())
         self.assertTrue(m_dir.is_dir())
 
+    def test_tool_list_dir_gitignore_filtering(self):
+        local_coder.tool_write_file(self.test_dir, ".gitignore", "ignored_dir/\n*.pyc\n")
+        (self.test_dir / ".git").mkdir()
+        (self.test_dir / "ignored_dir").mkdir()
+        local_coder.tool_write_file(self.test_dir, "ignored_dir/hidden.txt", "content")
+        local_coder.tool_write_file(self.test_dir, "test.pyc", "binary")
+        local_coder.tool_write_file(self.test_dir, "visible.txt", "content")
+
+        list_res = local_coder.tool_list_dir(self.test_dir, ".")
+        self.assertIn("[FILE] visible.txt", list_res)
+        self.assertNotIn("[DIR]  .git", list_res)
+        self.assertNotIn("[DIR]  ignored_dir", list_res)
+        self.assertNotIn("[FILE] test.pyc", list_res)
+
+        list_res_ignored = local_coder.tool_list_dir(self.test_dir, ".", show_ignored=True)
+        self.assertIn("[DIR]  .git", list_res_ignored)
+        self.assertIn("[DIR]  ignored_dir", list_res_ignored)
+        self.assertIn("[FILE] test.pyc", list_res_ignored)
+
     def test_windows_style_path_traversal(self):
         with self.assertRaises(ValueError):
             local_coder.get_safe_path(self.test_dir, "..\\..\\etc\\passwd")

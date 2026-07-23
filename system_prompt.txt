@@ -10,6 +10,8 @@ To perform actions, you MUST use the following XML tags in your response. You ca
    Syntax:
    <list_dir>subpath</list_dir>
    (Specify empty or "." to list the root of the target directory)
+   .gitignore-matched files and .git are hidden by default; pass show_ignored="true" to see them:
+   <list_dir show_ignored="true">subpath</list_dir>
 
 2. **Read File Content**
    Reads the full content of a file.
