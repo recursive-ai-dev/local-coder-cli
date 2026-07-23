@@ -252,6 +252,44 @@ class TestLocalCoder(unittest.TestCase):
         self.assertTrue(m_dir.exists())
         self.assertTrue(m_dir.is_dir())
 
+    def test_tool_search_files(self):
+        (self.test_dir / "dir").mkdir()
+        local_coder.tool_write_file(self.test_dir, "file1.txt", "apple\nbanana\ncherry\n")
+        local_coder.tool_write_file(self.test_dir, "dir/file2.txt", "date\napple\nfig\n")
+
+        res1 = local_coder.tool_search_files(self.test_dir, "apple", ".")
+        self.assertIn("file1.txt:1:apple", res1)
+        self.assertIn("dir/file2.txt:2:apple", res1)
+
+        res2 = local_coder.tool_search_files(self.test_dir, "apple", "dir")
+        self.assertNotIn("file1.txt", res2)
+        self.assertIn("dir/file2.txt:2:apple", res2)
+
+        large_file = self.test_dir / "large.txt"
+        with open(large_file, "wb") as f:
+            f.write(b"apple\n" * 100000)
+        res3 = local_coder.tool_search_files(self.test_dir, "apple", ".")
+        self.assertNotIn("large.txt", res3)
+        large_file.unlink()
+
+        res4 = local_coder.tool_search_files(self.test_dir, "[invalid", ".")
+        self.assertTrue(res4.startswith("Error: Invalid regex"))
+
+        local_coder.tool_write_file(self.test_dir, "many.txt", "match\n" * 250)
+        res5 = local_coder.tool_search_files(self.test_dir, "match", "many.txt")
+        self.assertIn("... [50 more items hidden]", res5)
+
+        res6 = local_coder.tool_search_files(self.test_dir, "xyz123", ".")
+        self.assertEqual(res6, "No matches found.")
+
+    def test_search_files_tag_parsing(self):
+        llm_response = '<search_files path=".">apple</search_files>'
+        local_coder.tool_write_file(self.test_dir, "f.txt", "apple\n")
+        results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "search_files")
+        self.assertIn("f.txt:1:apple", results[0]["result"])
+
     def test_tool_list_dir_gitignore_filtering(self):
         local_coder.tool_write_file(self.test_dir, ".gitignore", "ignored_dir/\n*.pyc\n")
         (self.test_dir / ".git").mkdir()
