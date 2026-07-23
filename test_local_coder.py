@@ -254,6 +254,32 @@ class TestLocalCoder(unittest.TestCase):
         self.assertTrue(m_dir.exists())
         self.assertTrue(m_dir.is_dir())
 
+    def test_tool_run_command(self):
+        res = local_coder.tool_run_command(self.test_dir, "echo 'hello world'")
+        self.assertIn("hello world", res)
+        self.assertIn("Exit code: 0", res)
+
+    def test_tool_run_command_timeout(self):
+        from unittest.mock import patch
+        import subprocess as sp
+        with patch("local_coder.subprocess.run", side_effect=sp.TimeoutExpired(cmd="x", timeout=30.0)):
+            res = local_coder.tool_run_command(self.test_dir, "some command")
+        self.assertIn("timed out", res)
+
+    def test_run_command_confirmation(self):
+        from unittest.mock import patch
+        llm_response = "<run_command>echo 'approved'</run_command>"
+
+        with patch("local_coder.Confirm.ask", return_value=False):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+        self.assertEqual(results[0]["tool"], "run_command")
+        self.assertIn("User denied command execution", results[0]["result"])
+
+        with patch("local_coder.Confirm.ask", return_value=True):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+        self.assertIn("approved", results[0]["result"])
+        self.assertIn("Exit code: 0", results[0]["result"])
+
     def test_console_repl_slash_commands(self):
         import io
         import sys as _sys

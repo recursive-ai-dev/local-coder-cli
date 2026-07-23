@@ -60,6 +60,11 @@ To perform actions, you MUST use the following XML tags in your response. You ca
    Syntax:
    <move_file src="path/to/source" dst="path/to/destination"/>
 
+8. **Run Command**
+   Executes a shell command in the target directory. Waits for completion up to 30s. Asks the user for confirmation before running.
+   Syntax:
+   <run_command>your shell command here</run_command>
+
 ### Guidelines:
 - Analyze the user request and explore the directory first if needed.
 - Write clean, well-structured code.

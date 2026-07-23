@@ -497,6 +497,45 @@ def tool_move_file(target_dir: Path, src: str, dst: str) -> str:
     except Exception as e:
         return f"Error moving file: {str(e)}"
 
+def tool_run_command(target_dir: Path, command: str) -> str:
+    try:
+        target_dir = target_dir.resolve()
+        # cwd=target_dir confines the working directory, but the command
+        # itself could still reference paths elsewhere (e.g. `rm ../x`) -
+        # ask_user_confirmation is the actual gate here, same as write_file
+        # and patch_file.
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=str(target_dir),
+                capture_output=True,
+                text=True,
+                timeout=30.0
+            )
+        except subprocess.TimeoutExpired:
+            return "Error: Command timed out after 30 seconds."
+
+        output = result.stdout
+        if result.stderr:
+            if output:
+                output += "\n"
+            output += "--- STDERR ---\n" + result.stderr
+
+        if not output.strip():
+            output = "Command executed successfully with no output."
+
+        lines = output.splitlines()
+        if len(lines) > 200:
+            hidden = len(lines) - 200
+            lines = lines[:200]
+            lines.append(f"... [{hidden} more lines hidden]")
+            output = "\n".join(lines)
+
+        return f"Exit code: {result.returncode}\nOutput:\n{output}"
+    except Exception as e:
+        return f"Error executing command: {str(e)}"
+
 def _tools_info_markdown() -> str:
     return (
         "**Available Tool Tags:**\n"
@@ -507,7 +546,8 @@ def _tools_info_markdown() -> str:
         "- `<patch_file path=\"...\"><search>...</search><replace>...</replace></patch_file>`: Edit a file (asks for confirmation)\n"
         "- `<delete_file>path</delete_file>`: Delete a file\n"
         "- `<move_file src=\"...\" dst=\"...\" />`: Move/rename a file\n"
-        "- `<spawn_agent name=\"...\">task</spawn_agent>`: Spawn a configured subagent for a task"
+        "- `<spawn_agent name=\"...\">task</spawn_agent>`: Spawn a configured subagent for a task\n"
+        "- `<run_command>shell command</run_command>`: Execute a shell command in the target directory (asks for confirmation, 30s timeout)"
     )
 
 def _agents_info_markdown(target_dir: Path) -> str:
@@ -554,6 +594,8 @@ def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
             
         line_numbers = tool_name != "patch_file"
         console.print(Panel(Syntax(preview_content, lexer, theme="monokai", line_numbers=line_numbers), title=f"File Content: {args_info}", border_style="green"))
+    elif tool_name == "run_command":
+        console.print(Panel(result, border_style="red", title="Command Output"))
     else:
         console.print(Panel(result, border_style="cyan", title="Tool Result"))
 
@@ -607,6 +649,9 @@ def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str
 
     for m in re.finditer(r"<move_file\s+src=([\"']?)(.*?)\1\s+dst=([\"']?)(.*?)\3\s*/>", text, re.DOTALL):
         matches.append((m.start(), "move_file", m))
+
+    for m in re.finditer(r"<run_command>(.*?)</run_command\s*>", text, re.DOTALL):
+        matches.append((m.start(), "run_command", m))
 
     matches.sort(key=lambda x: x[0])
 
@@ -699,6 +744,15 @@ def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str
             res = tool_move_file(target_dir, src, dst)
             format_and_print_tool_call("move_file", f"src='{src}' dst='{dst}'", res)
             results.append({"tool": "move_file", "path": f"{src} -> {dst}", "result": res})
+
+        elif tag_type == "run_command":
+            command = m.group(1).strip()
+            if not ask_user_confirmation("run_command", "shell", command):
+                results.append({"tool": "run_command", "path": ".", "result": "Error: User denied command execution."})
+                continue
+            res = tool_run_command(target_dir, command)
+            format_and_print_tool_call("run_command", command, res)
+            results.append({"tool": "run_command", "path": ".", "result": res})
 
     return results
 
