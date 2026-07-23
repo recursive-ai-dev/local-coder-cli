@@ -4,6 +4,7 @@ import time
 import sys
 import re
 import argparse
+import json
 import subprocess
 import atexit
 import socket
@@ -29,6 +30,89 @@ from textual import work
 
 console = Console()
 TUI_MODE = False
+
+TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "Lists files and folders inside the target directory. Specify empty or '.' to list the root of the target directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The path to the directory to list (relative to the target directory)."
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Reads the full content of a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The path to the file to read (relative to the target directory)."
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Creates a new file or completely overwrites an existing file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The path to the file to write (relative to the target directory)."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The content to write to the file."
+                    }
+                },
+                "required": ["path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "patch_file",
+            "description": "Modifies specific part(s) of an existing file. Be precise with the search block including indentation and whitespace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The path to the file to patch (relative to the target directory)."
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "The exact lines to search for in the file."
+                    },
+                    "replace": {
+                        "type": "string",
+                        "description": "The replacement lines."
+                    }
+                },
+                "required": ["path", "search", "replace"]
+            }
+        }
+    }
+]
 
 MODELS_PRESETS = {
     "1": {
@@ -234,6 +318,54 @@ def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
     else:
         console.print(Panel(result, border_style="cyan", title="Tool Result"))
 
+def execute_native_tools(target_dir: Path, tool_calls: list[dict]) -> list[dict]:
+    """Execute native JSON tools in the order they appear."""
+    results = []
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        tool_name = func.get("name")
+        args_str = func.get("arguments", "{}")
+        tool_id = tc.get("id")
+
+        try:
+            args = json.loads(args_str)
+        except json.JSONDecodeError:
+            res = f"Error: Invalid JSON arguments: {args_str}"
+            results.append({"tool": tool_name, "id": tool_id, "result": res})
+            continue
+
+        if tool_name == "list_dir":
+            path = args.get("path", "")
+            res = tool_list_dir(target_dir, path)
+            format_and_print_tool_call("list_dir", path, res)
+            results.append({"tool": "list_dir", "id": tool_id, "path": path, "result": res})
+
+        elif tool_name == "read_file":
+            path = args.get("path", "")
+            res = tool_read_file(target_dir, path)
+            format_and_print_tool_call("read_file", path, res)
+            results.append({"tool": "read_file", "id": tool_id, "path": path, "result": res})
+
+        elif tool_name == "write_file":
+            path = args.get("path", "")
+            content = args.get("content", "")
+            res = tool_write_file(target_dir, path, content)
+            format_and_print_tool_call("write_file", path, res)
+            results.append({"tool": "write_file", "id": tool_id, "path": path, "result": res})
+
+        elif tool_name == "patch_file":
+            path = args.get("path", "")
+            search = args.get("search", "")
+            replace = args.get("replace", "")
+            res = tool_patch_file(target_dir, path, search, replace)
+            format_and_print_tool_call("patch_file", path, res)
+            results.append({"tool": "patch_file", "id": tool_id, "path": path, "result": res})
+        else:
+            res = f"Error: Unknown tool '{tool_name}'"
+            results.append({"tool": tool_name, "id": tool_id, "result": res})
+
+    return results
+
 def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
     """Parse XML tags in response and execute tools in the order they appear."""
     matches = []
@@ -299,23 +431,33 @@ def compact_old_tool_results(messages: list[dict], keep_last: int = 1) -> None:
     accumulated bytes. Older results are already reflected in the model's own
     replies, so only the most recent `keep_last` need to stay verbatim.
     """
-    indices = [
-        i for i, m in enumerate(messages)
-        if m.get("role") == "user" and m.get("is_tool_result", False)
-    ]
-    for i in indices[:-keep_last] if keep_last else indices:
-        content = messages[i]["content"]
-        messages[i]["content"] = (
-            f"[Tool result omitted to save context — {len(content)} chars, already processed by the agent]"
-        )
+    tool_blocks = []
+    current_block = []
+    for i, m in enumerate(messages):
+        is_tool = m.get("role") == "tool" or (m.get("role") == "user" and m.get("is_tool_result", False))
+        if is_tool:
+            current_block.append(i)
+        elif current_block:
+            tool_blocks.append(current_block)
+            current_block = []
+    if current_block:
+        tool_blocks.append(current_block)
+
+    for block in tool_blocks[:-keep_last] if keep_last else tool_blocks:
+        for i in block:
+            content = messages[i]["content"]
+            messages[i]["content"] = (
+                f"[Tool result omitted to save context — {len(content)} chars, already processed by the agent]"
+            )
 
 class StreamInterrupted(Exception):
     """Raised when a user interrupts an in-progress stream (console mode only)."""
-    def __init__(self, partial_text: str):
+    def __init__(self, partial_text: str, tool_calls: list = None):
         super().__init__("Streaming interrupted by user")
         self.partial_text = partial_text
+        self.tool_calls = tool_calls or []
 
-def stream_completion(client: OpenAI, model: str, messages: list[dict], on_update, throttle_every: int = 20) -> str:
+def stream_completion(client: OpenAI, model: str, messages: list[dict], on_update, throttle_every: int = 20, tool_mode: str = "auto"):
     """Stream one chat completion, calling on_update(accumulated_text) at a throttled cadence.
 
     This is the single place that accumulates chunks and applies bounds-checking/
@@ -325,29 +467,63 @@ def stream_completion(client: OpenAI, model: str, messages: list[dict], on_updat
     """
     parts = []
     chunk_count = 0
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.2,
-        stream=True,
-        timeout=120.0
-    )
+    tool_calls_dict = {}
+
+    kwargs = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        "stream": True,
+        "timeout": 120.0
+    }
+
+    if tool_mode in ("functions", "auto"):
+        kwargs["tools"] = TOOLS_SCHEMA
+
+    response = client.chat.completions.create(**kwargs)
+
     try:
         for chunk in response:
-            if chunk.choices and chunk.choices[0].delta.content:
-                content = chunk.choices[0].delta.content
-                parts.append(content)
-                chunk_count += 1
-                if chunk_count % throttle_every == 0 or "\n" in content:
-                    on_update("".join(parts))
+            if chunk.choices:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    content = delta.content
+                    parts.append(content)
+                    chunk_count += 1
+                    if chunk_count % throttle_every == 0 or "\n" in content:
+                        on_update("".join(parts))
+
+                if delta.tool_calls:
+                    for tc_chunk in delta.tool_calls:
+                        idx = tc_chunk.index
+                        if idx not in tool_calls_dict:
+                            tool_calls_dict[idx] = {
+                                "id": tc_chunk.id or "",
+                                "type": tc_chunk.type or "function",
+                                "function": {
+                                    "name": tc_chunk.function.name or "",
+                                    "arguments": tc_chunk.function.arguments or ""
+                                }
+                            }
+                        else:
+                            if tc_chunk.id:
+                                tool_calls_dict[idx]["id"] += tc_chunk.id
+                            if tc_chunk.function:
+                                if tc_chunk.function.name:
+                                    tool_calls_dict[idx]["function"]["name"] += tc_chunk.function.name
+                                if tc_chunk.function.arguments:
+                                    tool_calls_dict[idx]["function"]["arguments"] += tc_chunk.function.arguments
     except KeyboardInterrupt:
         partial_text = "".join(parts)
         on_update(partial_text)
-        raise StreamInterrupted(partial_text)
+        tool_calls_list = [v for k, v in sorted(tool_calls_dict.items())]
+        raise StreamInterrupted(partial_text, tool_calls_list)
 
     full_text = "".join(parts)
     on_update(full_text)
-    return full_text
+
+    tool_calls_list = [v for k, v in sorted(tool_calls_dict.items())]
+    return full_text, tool_calls_list
 
 def build_tool_result_message(tool_results: list[dict]) -> str:
     parts = [
@@ -356,57 +532,80 @@ def build_tool_result_message(tool_results: list[dict]) -> str:
     ]
     return "\n".join(parts)
 
-def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int):
+def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int, tool_mode: str = "auto"):
     """Executes the agentic reasoning & execution loop with live updates."""
     for i in range(1, max_iterations + 1):
         console.print(f"\n[bold blue]🤖 Agent Thinking (Step {i}/{max_iterations}) ...[/bold blue]")
 
         assistant_response = ""
+        assistant_tool_calls = []
         try:
             with Live(console=console, refresh_per_second=8) as live:
                 def on_update(text):
                     live.update(Panel(Markdown(text), title=f"[bold green]Assistant (Step {i})[/bold green]", border_style="blue"))
-                assistant_response = stream_completion(client, model, messages, on_update)
+                assistant_response, assistant_tool_calls = stream_completion(client, model, messages, on_update, tool_mode=tool_mode)
         except StreamInterrupted as e:
             console.print("\n[bold yellow]Generation interrupted by user.[/bold yellow]")
             assistant_response = e.partial_text
-            if not assistant_response:
+            assistant_tool_calls = e.tool_calls
+            if not assistant_response and not assistant_tool_calls:
                 break
         except Exception as e:
             console.print(f"[bold red]API call failed:[/bold red] {e}")
             break
 
-        if not assistant_response:
+        if not assistant_response and not assistant_tool_calls:
             console.print("[bold red]Received empty response from the model.[/bold red]")
             break
 
-        messages.append({"role": "assistant", "content": assistant_response})
+        assistant_message = {"role": "assistant", "content": assistant_response}
+        if assistant_tool_calls:
+            assistant_message["tool_calls"] = assistant_tool_calls
 
-        tool_results = parse_and_execute_tools(target_dir, assistant_response)
+        messages.append(assistant_message)
 
-        if not tool_results:
-            console.print("[bold green]✔ No tools triggered or task complete.[/bold green]")
-            break
+        if assistant_tool_calls:
+            tool_results = execute_native_tools(target_dir, assistant_tool_calls)
+            for tr in tool_results:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tr["id"],
+                    "content": tr["result"]
+                })
+            compact_old_tool_results(messages)
+        else:
+            tool_results = parse_and_execute_tools(target_dir, assistant_response)
 
-        result_message = build_tool_result_message(tool_results)
-        console.print(f"[bold cyan]Sending tool results back to LLM...[/bold cyan]")
-        messages.append({"role": "user", "content": result_message, "is_tool_result": True})
-        compact_old_tool_results(messages)
+            if not tool_results:
+                console.print("[bold green]✔ No tools triggered or task complete.[/bold green]")
+                break
+
+            result_message = build_tool_result_message(tool_results)
+            console.print(f"[bold cyan]Sending tool results back to LLM...[/bold cyan]")
+            messages.append({"role": "user", "content": result_message, "is_tool_result": True})
+            compact_old_tool_results(messages)
 
     return messages
 
-def run_single_prompt(client: OpenAI, model: str, messages: list[dict]):
+def run_single_prompt(client: OpenAI, model: str, messages: list[dict], tool_mode: str = "auto"):
     console.print(f"[bold blue]Sending prompt to LLM...[/bold blue]")
     try:
         with Live(console=console, refresh_per_second=8) as live:
             def on_update(text):
                 live.update(Panel(Markdown(text), title="Assistant Response", border_style="blue"))
-            assistant_response = stream_completion(client, model, messages, on_update)
-        messages.append({"role": "assistant", "content": assistant_response})
+            assistant_response, assistant_tool_calls = stream_completion(client, model, messages, on_update, tool_mode=tool_mode)
+
+        assistant_message = {"role": "assistant", "content": assistant_response}
+        if assistant_tool_calls:
+            assistant_message["tool_calls"] = assistant_tool_calls
+        messages.append(assistant_message)
     except StreamInterrupted as e:
         console.print("\n[bold yellow]Generation interrupted by user.[/bold yellow]")
-        if e.partial_text:
-            messages.append({"role": "assistant", "content": e.partial_text})
+        if e.partial_text or e.tool_calls:
+            assistant_message = {"role": "assistant", "content": e.partial_text}
+            if e.tool_calls:
+                assistant_message["tool_calls"] = e.tool_calls
+            messages.append(assistant_message)
     except Exception as e:
         console.print(f"[bold red]API call failed:[/bold red] {e}")
     return messages
@@ -708,7 +907,7 @@ class LocalCoderApp(App):
     }
     """
     
-    def __init__(self, client, model, target_dir, messages, agent_mode, max_iterations):
+    def __init__(self, client, model, target_dir, messages, agent_mode, max_iterations, tool_mode="auto"):
         super().__init__()
         self.client = client
         self.model = model
@@ -716,6 +915,7 @@ class LocalCoderApp(App):
         self.messages = messages
         self.agent_mode = agent_mode
         self.max_iterations = max_iterations
+        self.tool_mode = tool_mode
         self.is_processing = False
 
     def compose(self) -> ComposeResult:
@@ -813,9 +1013,13 @@ class LocalCoderApp(App):
             self.call_from_thread(self.chat_history.scroll_end, animate=False)
 
         try:
-            assistant_response = stream_completion(self.client, self.model, self.messages, on_update)
+            assistant_response, assistant_tool_calls = stream_completion(self.client, self.model, self.messages, on_update, tool_mode=self.tool_mode)
             self.call_from_thread(self._trim_chat_history)
-            self.messages.append({"role": "assistant", "content": assistant_response})
+
+            assistant_message = {"role": "assistant", "content": assistant_response}
+            if assistant_tool_calls:
+                assistant_message["tool_calls"] = assistant_tool_calls
+            self.messages.append(assistant_message)
 
         except Exception as e:
             self.call_from_thread(self.chat_history.mount, ChatMessage(f"Error: {e}", "system"))
@@ -836,27 +1040,43 @@ class LocalCoderApp(App):
                     self.call_from_thread(_stream_msg.update_content, text)
                     self.call_from_thread(self.chat_history.scroll_end, animate=False)
 
-                assistant_response = stream_completion(self.client, self.model, self.messages, on_update)
+                assistant_response, assistant_tool_calls = stream_completion(self.client, self.model, self.messages, on_update, tool_mode=self.tool_mode)
 
-                self.messages.append({"role": "assistant", "content": assistant_response})
+                assistant_message = {"role": "assistant", "content": assistant_response}
+                if assistant_tool_calls:
+                    assistant_message["tool_calls"] = assistant_tool_calls
+                self.messages.append(assistant_message)
 
-                # Execute tools
-                tool_results = parse_and_execute_tools(self.target_dir, assistant_response)
-
-                if not tool_results:
-                    self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))
+                if assistant_tool_calls:
+                    tool_results = execute_native_tools(self.target_dir, assistant_tool_calls)
+                    for tr in tool_results:
+                        self.call_from_thread(self.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr.get('path', '')}:\n{tr['result']}", "system"))
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tr["id"],
+                            "content": tr["result"]
+                        })
+                    compact_old_tool_results(self.messages)
                     self.call_after_refresh(self.chat_history.scroll_end, animate=False)
-                    break
+                    self.call_from_thread(self._trim_chat_history)
+                else:
+                    # Execute tools
+                    tool_results = parse_and_execute_tools(self.target_dir, assistant_response)
 
-                for tr in tool_results:
-                    # Show tool result in UI
-                    self.call_from_thread(self.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr['path']}:\n{tr['result']}", "system"))
+                    if not tool_results:
+                        self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))
+                        self.call_after_refresh(self.chat_history.scroll_end, animate=False)
+                        break
 
-                result_message = build_tool_result_message(tool_results)
-                self.messages.append({"role": "user", "content": result_message, "is_tool_result": True})
-                compact_old_tool_results(self.messages)
-                self.call_after_refresh(self.chat_history.scroll_end, animate=False)
-                self.call_from_thread(self._trim_chat_history)
+                    for tr in tool_results:
+                        # Show tool result in UI
+                        self.call_from_thread(self.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr['path']}:\n{tr['result']}", "system"))
+
+                    result_message = build_tool_result_message(tool_results)
+                    self.messages.append({"role": "user", "content": result_message, "is_tool_result": True})
+                    compact_old_tool_results(self.messages)
+                    self.call_after_refresh(self.chat_history.scroll_end, animate=False)
+                    self.call_from_thread(self._trim_chat_history)
 
         except Exception as e:
             self.call_from_thread(self.chat_history.mount, ChatMessage(f"Error: {e}", "system"))
@@ -875,6 +1095,7 @@ def main():
     parser.add_argument("--agent", action="store_true", help="Enable autonomous agent loop with filesystem tools")
     parser.add_argument("--max-iterations", type=int, default=10, help="Maximum number of loop iterations for agent mode")
     parser.add_argument("-i", "--interactive", action="store_true", help="Force launch the interactive REPL shell")
+    parser.add_argument("--tool-mode", choices=["xml", "functions", "auto"], default="auto", help="Tool calling protocol to use")
     parser.add_argument("prompt", nargs="?", help="The programming task / instruction for the LLM")
     
     args = parser.parse_args()
@@ -917,15 +1138,15 @@ def main():
     if is_interactive:
         global TUI_MODE
         TUI_MODE = True
-        app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations)
+        app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations, tool_mode=args.tool_mode)
         app.run()
     else:
         messages.append({"role": "user", "content": args.prompt})
         console.print(Panel(f"[bold green]Target Directory:[/bold green] {target_dir.resolve()}\n[bold green]Provider:[/bold green] {provider} ({api_url})\n[bold green]Task:[/bold green] {args.prompt}", title="Agent Run Started"))
         if args.agent:
-            run_agent_loop(client, model, target_dir, messages, args.max_iterations)
+            run_agent_loop(client, model, target_dir, messages, args.max_iterations, tool_mode=args.tool_mode)
         else:
-            run_single_prompt(client, model, messages)
+            run_single_prompt(client, model, messages, tool_mode=args.tool_mode)
 
 if __name__ == "__main__":
     main()

@@ -98,6 +98,41 @@ class TestLocalCoder(unittest.TestCase):
         self.assertEqual(results[1]["path"], "script.py")
         self.assertEqual(results[1]["result"], 'print("Hello CLI")\n')
 
+    def test_execute_native_tools(self):
+        import json
+        tool_calls = [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": json.dumps({"path": "script_native.py", "content": "print('Hello Native')\n"})
+                }
+            },
+            {
+                "id": "call_2",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "script_native.py"})
+                }
+            }
+        ]
+
+        results = local_coder.execute_native_tools(self.test_dir, tool_calls)
+
+        self.assertEqual(len(results), 2)
+
+        self.assertEqual(results[0]["id"], "call_1")
+        self.assertEqual(results[0]["tool"], "write_file")
+        self.assertEqual(results[0]["path"], "script_native.py")
+        self.assertIn("Successfully wrote", results[0]["result"])
+
+        self.assertEqual(results[1]["id"], "call_2")
+        self.assertEqual(results[1]["tool"], "read_file")
+        self.assertEqual(results[1]["path"], "script_native.py")
+        self.assertEqual(results[1]["result"], "print('Hello Native')\n")
+
     def test_provider_detection_fallback(self):
         # When no endpoints are active, detect_provider returns (None, None)
         prov, url = local_coder.detect_provider()
