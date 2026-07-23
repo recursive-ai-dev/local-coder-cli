@@ -137,6 +137,54 @@ def tool_read_file(target_dir: Path, path: str) -> str:
     except Exception as e:
         return f"Error reading file: {str(e)}"
 
+def tool_search_files(target_dir: Path, pattern: str, path: str = ".") -> str:
+    try:
+        target_dir = target_dir.resolve()
+        safe_path = get_safe_path(target_dir, path)
+        if not safe_path.exists():
+            return f"Error: Path '{path}' does not exist."
+
+        try:
+            regex = re.compile(pattern)
+        except re.error as e:
+            return f"Error: Invalid regex pattern: {str(e)}"
+
+        matches = []
+        total_matches = 0
+
+        files_to_check = []
+        if safe_path.is_file():
+            files_to_check.append(safe_path)
+        else:
+            for root, _, files in os.walk(safe_path):
+                for f in files:
+                    files_to_check.append(Path(root) / f)
+
+        for f_path in files_to_check:
+            try:
+                if f_path.stat().st_size > 500 * 1024:
+                    continue
+                content = f_path.read_text(encoding="utf-8")
+                for i, line in enumerate(content.splitlines(), start=1):
+                    if regex.search(line):
+                        if total_matches < 200:
+                            rel_path = f_path.relative_to(target_dir)
+                            matches.append(f"{rel_path}:{i}:{line}")
+                        total_matches += 1
+            except (UnicodeDecodeError, FileNotFoundError, PermissionError):
+                continue
+
+        if total_matches == 0:
+            return "No matches found."
+
+        if total_matches > 200:
+            hidden = total_matches - 200
+            matches.append(f"... [{hidden} more items hidden]")
+
+        return "\n".join(matches)
+    except Exception as e:
+        return f"Error searching files: {str(e)}"
+
 def tool_write_file(target_dir: Path, path: str, content: str) -> str:
     try:
         target_dir = target_dir.resolve()
@@ -250,6 +298,9 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
     for m in re.finditer(r"<patch_file\s+path=([\"']?)(.*?)\1[^>]*>\s*<search>(.*?)</search>\s*<replace>(.*?)</replace>\s*</patch_file\s*>", text, re.DOTALL):
         matches.append((m.start(), "patch_file", m))
         
+    for m in re.finditer(r"<search_files(?:\s+path=([\"']?)(.*?)\1)?[^>]*>(.*?)</search_files\s*>", text, re.DOTALL):
+        matches.append((m.start(), "search_files", m))
+
     matches.sort(key=lambda x: x[0])
     
     results = []
@@ -266,6 +317,14 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
             format_and_print_tool_call("read_file", path, res)
             results.append({"tool": "read_file", "path": path, "result": res})
             
+        elif tag_type == "search_files":
+            # m.group(1) is quote, m.group(2) is path, m.group(3) is pattern
+            path = m.group(2).strip() if m.group(2) else "."
+            pattern = m.group(3).strip()
+            res = tool_search_files(target_dir, pattern, path)
+            format_and_print_tool_call("search_files", f"path='{path}', pattern='{pattern}'", res)
+            results.append({"tool": "search_files", "path": path, "pattern": pattern, "result": res})
+
         elif tag_type == "write_file":
             path = m.group(2).strip()
             content = m.group(3)

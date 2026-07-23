@@ -16,14 +16,20 @@ To perform actions, you MUST use the following XML tags in your response. You ca
    Syntax:
    <read_file>path/to/file</read_file>
 
-3. **Write File**
+3. **Search Files**
+   Searches for a regular expression in a specific file or all files in a directory. Results are capped at 200 matches.
+   Syntax:
+   <search_files path="subpath">regex pattern</search_files>
+   (Specify empty or "." for path to search the root of the target directory)
+
+4. **Write File**
    Creates a new file or completely overwrites an existing file.
    Syntax:
    <write_file path="path/to/file">
    Your file content here
    </write_file>
 
-4. **Patch File**
+5. **Patch File**
    Modifies specific part(s) of an existing file. Be precise with the search block including indentation and whitespace.
    Syntax:
    <patch_file path="path/to/file">

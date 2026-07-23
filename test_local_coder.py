@@ -39,6 +39,43 @@ class TestLocalCoder(unittest.TestCase):
         read_res = local_coder.tool_read_file(self.test_dir, "test.txt")
         self.assertEqual(read_res, "Hello World")
 
+    def test_tool_search_files(self):
+        # Create test files
+        (self.test_dir / "dir").mkdir()
+        local_coder.tool_write_file(self.test_dir, "file1.txt", "apple\nbanana\ncherry\n")
+        local_coder.tool_write_file(self.test_dir, "dir/file2.txt", "date\napple\nfig\n")
+
+        # Test basic search
+        res1 = local_coder.tool_search_files(self.test_dir, "apple", ".")
+        self.assertIn("file1.txt:1:apple", res1)
+        self.assertIn("dir/file2.txt:2:apple", res1)
+
+        # Test search with path
+        res2 = local_coder.tool_search_files(self.test_dir, "apple", "dir")
+        self.assertNotIn("file1.txt", res2)
+        self.assertIn("dir/file2.txt:2:apple", res2)
+
+        # Test file limit constraint (>500KB)
+        large_file = self.test_dir / "large.txt"
+        with open(large_file, "wb") as f:
+            f.write(b"apple\n" * 100000) # >500KB
+        res3 = local_coder.tool_search_files(self.test_dir, "apple", ".")
+        self.assertNotIn("large.txt", res3)
+        large_file.unlink()
+
+        # Test invalid regex
+        res4 = local_coder.tool_search_files(self.test_dir, "[invalid", ".")
+        self.assertTrue(res4.startswith("Error: Invalid regex"))
+
+        # Test 200 result capping
+        local_coder.tool_write_file(self.test_dir, "many.txt", "match\n" * 250)
+        res5 = local_coder.tool_search_files(self.test_dir, "match", "many.txt")
+        self.assertIn("... [50 more items hidden]", res5)
+
+        # Test no matches
+        res6 = local_coder.tool_search_files(self.test_dir, "xyz123", ".")
+        self.assertEqual(res6, "No matches found.")
+
     def test_tool_list_dir(self):
         # Create files & folders
         local_coder.tool_write_file(self.test_dir, "a.txt", "content")
