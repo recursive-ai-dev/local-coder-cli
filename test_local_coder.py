@@ -2,6 +2,7 @@ import unittest
 import tempfile
 import shutil
 import time
+import json
 from pathlib import Path
 import local_coder
 
@@ -252,6 +253,34 @@ class TestLocalCoder(unittest.TestCase):
         m_dir = local_coder.get_models_dir()
         self.assertTrue(m_dir.exists())
         self.assertTrue(m_dir.is_dir())
+
+    def test_get_all_agents_merges_builtin_and_custom(self):
+        agents_dir = self.test_dir / ".local-coder" / "agents"
+        agents_dir.mkdir(parents=True)
+        mock_agent_data = {
+            "name": "Mock Agent",
+            "description": "A mock agent for testing.",
+            "system_prompt": "Mock system prompt.",
+            "allowed_tools": ["read_file"]
+        }
+        (agents_dir / "mock_agent.json").write_text(json.dumps(mock_agent_data), encoding="utf-8")
+
+        agents = local_coder.get_all_agents(self.test_dir)
+        self.assertIn("mock_agent", agents)
+        self.assertEqual(agents["mock_agent"]["name"], "Mock Agent")
+        self.assertIn("coder", agents)
+        self.assertIn("explorer", agents)
+        self.assertIn("reviewer", agents)
+
+    def test_scaffold_create_agent(self):
+        local_coder.scaffold_create_agent(self.test_dir, "myagent")
+        created = self.test_dir / ".local-coder" / "agents" / "myagent.json"
+        self.assertTrue(created.exists())
+        data = json.loads(created.read_text())
+        self.assertEqual(data["name"], "Myagent")
+
+        with self.assertRaises(SystemExit):
+            local_coder.scaffold_create_agent(self.test_dir, "myagent")
 
     def test_save_load_session(self):
         session_file = self.test_dir / ".local-coder" / "sessions" / "test_session.json"

@@ -36,6 +36,7 @@ _YOLO_MODE = False
 _SHOW_IGNORED = False
 _MAX_HISTORY = 20
 _SESSION_FILE = None
+_ALLOWED_TOOLS = None
 _APP_INSTANCE = None
 
 MODELS_PRESETS = {
@@ -76,6 +77,86 @@ MODELS_PRESETS = {
         }
     }
 }
+
+BUILTIN_AGENTS = {
+    "coder": {
+        "name": "Coder",
+        "description": "Full-featured coding agent with read/write access to the local filesystem.",
+        "system_prompt": "You are a helpful coding assistant. You have local file system access. You can read, write, and patch files in the target directory to complete coding tasks.",
+        "allowed_tools": ["list_dir", "read_file", "search_files", "write_file", "patch_file", "delete_file", "move_file"]
+    },
+    "explorer": {
+        "name": "Explorer",
+        "description": "Read-only agent for exploring the codebase and answering questions. Cannot write or modify files.",
+        "system_prompt": "You are a read-only exploration assistant. You can list directories, read files, and search file contents to answer questions about the codebase, but you cannot make any changes.",
+        "allowed_tools": ["list_dir", "read_file", "search_files"]
+    },
+    "reviewer": {
+        "name": "Reviewer",
+        "description": "Read-only agent for reviewing code. Cannot write or modify files.",
+        "system_prompt": "You are a strict code reviewer. Read the requested files and provide constructive feedback on bugs, style, and structure. You cannot modify the files.",
+        "allowed_tools": ["list_dir", "read_file", "search_files"]
+    }
+}
+
+def get_agents_dir(target_dir: Path) -> Path:
+    """Project-local agent profiles directory, matching load_agent_config's convention."""
+    a_dir = target_dir / ".local-coder" / "agents"
+    a_dir.mkdir(parents=True, exist_ok=True)
+    return a_dir
+
+def get_all_agents(target_dir: Path) -> dict:
+    """Merge built-in presets with project-local (.local-coder/agents/) profiles."""
+    agents = BUILTIN_AGENTS.copy()
+    a_dir = get_agents_dir(target_dir)
+    for file_path in a_dir.glob("*.json"):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if "name" in data and "description" in data:
+                    agents[file_path.stem] = data
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not load agent profile from {file_path}: {e}[/yellow]")
+    return agents
+
+def print_list_agents(target_dir: Path):
+    agents = get_all_agents(target_dir)
+    table = Table(title="Available Agent Profiles", show_header=True, header_style="bold magenta")
+    table.add_column("Key", style="cyan")
+    table.add_column("Name", style="green")
+    table.add_column("Type", style="dim")
+    table.add_column("Description", style="white")
+    table.add_column("Allowed Tools", style="blue")
+
+    for key, data in agents.items():
+        agent_type = "Built-in" if key in BUILTIN_AGENTS else "Custom"
+        allowed = ", ".join(data.get("allowed_tools", []) or ["(all)"])
+        table.add_row(key, data.get("name", "Unknown"), agent_type, data.get("description", ""), allowed)
+
+    console.print(table)
+
+def scaffold_create_agent(target_dir: Path, name: str):
+    a_dir = get_agents_dir(target_dir)
+    file_path = a_dir / f"{name}.json"
+    if file_path.exists():
+        console.print(f"[bold red]Error: Agent profile '{name}' already exists at {file_path}[/bold red]")
+        sys.exit(1)
+
+    template = {
+        "name": name.title(),
+        "description": "A custom agent profile.",
+        "system_prompt": "You are a helpful coding assistant. You have local file system access.",
+        "allowed_tools": ["list_dir", "read_file", "search_files", "write_file", "patch_file"]
+    }
+
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(template, f, indent=4)
+        console.print(f"[bold green]✔ Successfully created custom agent profile '{name}' at {file_path}[/bold green]")
+        console.print("Edit this file to customize the agent's behavior.")
+    except Exception as e:
+        console.print(f"[bold red]Error creating agent profile:[/bold red] {e}")
+        sys.exit(1)
 
 def get_models_dir() -> Path:
     if getattr(sys, 'frozen', False):
@@ -825,7 +906,7 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
         messages.append({"role": "assistant", "content": assistant_response})
         save_session(_SESSION_FILE, messages)
 
-        tool_results = parse_and_execute_tools(target_dir, assistant_response, subagent_runner=subagent_runner_callable)
+        tool_results = parse_and_execute_tools(target_dir, assistant_response, allowed_tools=_ALLOWED_TOOLS, subagent_runner=subagent_runner_callable)
 
         if not tool_results:
             console.print("[bold green]✔ No tools triggered or task complete.[/bold green]")
@@ -1342,7 +1423,7 @@ class LocalCoderApp(App):
                 save_session(_SESSION_FILE, self.messages)
 
                 # Execute tools
-                tool_results = parse_and_execute_tools(self.target_dir, assistant_response, subagent_runner=subagent_runner_callable)
+                tool_results = parse_and_execute_tools(self.target_dir, assistant_response, allowed_tools=_ALLOWED_TOOLS, subagent_runner=subagent_runner_callable)
 
                 if not tool_results:
                     self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))
@@ -1384,6 +1465,9 @@ def main():
     parser.add_argument("--show-ignored", action="store_true", help="Do not filter out .git and .gitignore-matched files in directory listings")
     parser.add_argument("--max-history", type=int, default=20, help="Maximum number of messages to keep in context (rolling window)")
     parser.add_argument("--resume", nargs="?", const="LATEST", help="Resume a previous session (provide filename or leave blank for most recent)")
+    parser.add_argument("--list-agents", action="store_true", help="List all available agent profiles (built-in and project-local) and exit")
+    parser.add_argument("--create-agent", type=str, help="Scaffold a new agent profile JSON in .local-coder/agents/ with the given name")
+    parser.add_argument("--agent-profile", type=str, help="Launch the main agent with a specific profile (overrides --system-prompt, forces --agent)")
     parser.add_argument("prompt", nargs="?", help="The programming task / instruction for the LLM")
 
     args = parser.parse_args()
@@ -1403,9 +1487,30 @@ def main():
     if not target_dir.exists():
         console.print(f"[bold yellow]Target directory '{target_dir}' does not exist. Creating it...[/bold yellow]")
         target_dir.mkdir(parents=True, exist_ok=True)
-        
+
+    if args.list_agents:
+        print_list_agents(target_dir)
+        sys.exit(0)
+
+    if args.create_agent:
+        scaffold_create_agent(target_dir, args.create_agent)
+        sys.exit(0)
+
+    global _ALLOWED_TOOLS
+    if args.agent_profile:
+        agents = get_all_agents(target_dir)
+        if args.agent_profile not in agents:
+            console.print(f"[bold red]Error: Agent profile '{args.agent_profile}' not found.[/bold red]")
+            console.print("Use --list-agents to see available profiles.")
+            sys.exit(1)
+        profile = agents[args.agent_profile]
+        _ALLOWED_TOOLS = profile.get("allowed_tools")
+        args.agent = True
+
     system_prompt_content = ""
-    if args.system_prompt:
+    if args.agent_profile:
+        system_prompt_content = agents[args.agent_profile].get("system_prompt", "You are a helpful coding assistant.")
+    elif args.system_prompt:
         sys_prompt_path = Path(args.system_prompt)
         if sys_prompt_path.exists():
             system_prompt_content = sys_prompt_path.read_text(encoding="utf-8")
