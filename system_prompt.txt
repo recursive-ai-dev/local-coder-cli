@@ -41,6 +41,16 @@ To perform actions, you MUST use the following XML tags in your response. You ca
    <spawn_agent name="agent_name">
    Description of the task for the subagent to perform
    </spawn_agent>
+   
+6. **Delete File**
+   Deletes an existing file.
+   Syntax:
+   <delete_file>path/to/file</delete_file>
+
+7. **Move/Rename File**
+   Moves or renames a file.
+   Syntax:
+   <move_file src="path/to/source" dst="path/to/destination"/>
 
 ### Guidelines:
 - Analyze the user request and explore the directory first if needed.

@@ -83,6 +83,8 @@ class TestLocalCoder(unittest.TestCase):
             "def sub(a, b):\n    # Subtract b from a\n    return a - b"
         )
         self.assertIn("Successfully applied patch", patch_res)
+        self.assertIn("--- math_utils.py", patch_res)
+        self.assertIn("+++ math_utils.py", patch_res)
         
         patched_content = local_coder.tool_read_file(self.test_dir, "math_utils.py")
         self.assertIn("# Subtract b from a", patched_content)
@@ -92,8 +94,44 @@ class TestLocalCoder(unittest.TestCase):
         patch_res2 = local_coder.tool_patch_file(self.test_dir, "math_utils_2.py", "def a():\n  pass", "def a():\n  return 1")
         self.assertIn("Error: Search block found multiple times", patch_res2)
 
+    def test_tool_delete_file(self):
+        # Create a file
+        local_coder.tool_write_file(self.test_dir, "delete_me.txt", "content")
+        self.assertTrue((self.test_dir / "delete_me.txt").exists())
+
+        # Delete it
+        res = local_coder.tool_delete_file(self.test_dir, "delete_me.txt")
+        self.assertIn("Successfully deleted", res)
+        self.assertFalse((self.test_dir / "delete_me.txt").exists())
+
+        # Path traversal should return error rather than throwing, as caught by the function's try-except block
+        # Actually wait, ValueError is raised by get_safe_path, then caught by the try-except in tool_delete_file
+        # and returned as string.
+        res2 = local_coder.tool_delete_file(self.test_dir, "../out_of_bounds.txt")
+        self.assertIn("Error deleting file:", res2)
+        self.assertIn("escapes target directory", res2)
+
+    def test_tool_move_file(self):
+        # Create a file
+        local_coder.tool_write_file(self.test_dir, "move_src.txt", "content")
+        self.assertTrue((self.test_dir / "move_src.txt").exists())
+
+        # Move it
+        res = local_coder.tool_move_file(self.test_dir, "move_src.txt", "subdir/move_dst.txt")
+        self.assertIn("Successfully moved", res)
+        self.assertFalse((self.test_dir / "move_src.txt").exists())
+        self.assertTrue((self.test_dir / "subdir" / "move_dst.txt").exists())
+
+        # Path traversal
+        res2 = local_coder.tool_move_file(self.test_dir, "subdir/move_dst.txt", "../escaped.txt")
+        self.assertIn("Error moving file:", res2)
+        self.assertIn("escapes target directory", res2)
+
     def test_parse_and_execute_tools(self):
         import textwrap
+        # Set YOLO mode to true for original test behavior
+        local_coder._YOLO_MODE = True
+
         # We simulate the LLM's response containing multiple tool blocks
         llm_response = textwrap.dedent("""\
             I will create a script and verify it.
@@ -114,6 +152,57 @@ class TestLocalCoder(unittest.TestCase):
         self.assertEqual(results[1]["tool"], "read_file")
         self.assertEqual(results[1]["path"], "script.py")
         self.assertEqual(results[1]["result"], 'print("Hello CLI")\n')
+        local_coder._YOLO_MODE = False
+
+    def test_ask_user_confirmation_console_deny(self):
+        import textwrap
+        from unittest.mock import patch
+
+        local_coder._YOLO_MODE = False
+        local_coder.TUI_MODE = False
+
+        llm_response = textwrap.dedent("""\
+            <write_file path="evil.py" lang="python">
+            print("pwned")
+            </write_file>
+        """)
+
+        with patch("local_coder.Confirm.ask", return_value=False):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "write_file")
+        self.assertEqual(results[0]["path"], "evil.py")
+        self.assertEqual(results[0]["result"], "Error: User denied permission to write file.")
+
+        # Verify file was NOT created
+        file_path = self.test_dir / "evil.py"
+        self.assertFalse(file_path.exists())
+
+    def test_ask_user_confirmation_console_allow(self):
+        import textwrap
+        from unittest.mock import patch
+
+        local_coder._YOLO_MODE = False
+        local_coder.TUI_MODE = False
+
+        llm_response = textwrap.dedent("""\
+            <write_file path="good.py" lang="python">
+            print("good")
+            </write_file>
+        """)
+
+        with patch("local_coder.Confirm.ask", return_value=True):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "write_file")
+        self.assertEqual(results[0]["path"], "good.py")
+        self.assertIn("Successfully wrote", results[0]["result"])
+
+        # Verify file WAS created
+        file_path = self.test_dir / "good.py"
+        self.assertTrue(file_path.exists())
 
     def test_spawn_agent_parsing(self):
         llm_response = """\

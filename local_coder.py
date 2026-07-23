@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import time
+import difflib
 import sys
 import re
 import argparse
@@ -8,6 +9,7 @@ import subprocess
 import atexit
 import socket
 import json
+import threading
 import concurrent.futures
 from pathlib import Path
 import httpx
@@ -18,7 +20,7 @@ from rich.syntax import Syntax
 from rich.live import Live
 from rich.table import Table
 from rich.markdown import Markdown
-from rich.prompt import Prompt
+from rich.prompt import Prompt, Confirm
 from rich.align import Align
 
 from textual.app import App, ComposeResult
@@ -30,6 +32,8 @@ from textual import work
 
 console = Console()
 TUI_MODE = False
+_YOLO_MODE = False
+_APP_INSTANCE = None
 
 MODELS_PRESETS = {
     "1": {
@@ -195,6 +199,16 @@ def tool_patch_file(target_dir: Path, path: str, search: str, replace: str) -> s
                 new_content = new_content.replace("\n", "\r\n")
             safe_path.write_text(new_content, encoding="utf-8")
             os.chmod(safe_path, orig_mode)
+
+            diff_lines = list(difflib.unified_diff(
+                original_content.splitlines(keepends=True),
+                new_content.splitlines(keepends=True),
+                fromfile=path,
+                tofile=path
+            ))
+            diff_text = "".join(diff_lines)
+            if diff_text:
+                message += f"\n\n```diff\n{diff_text}```"
             return message
 
         idx = original_content.find(search)
@@ -221,6 +235,36 @@ def tool_patch_file(target_dir: Path, path: str, search: str, replace: str) -> s
     except Exception as e:
         return f"Error patching file: {str(e)}"
 
+def tool_delete_file(target_dir: Path, path: str) -> str:
+    try:
+        target_dir = target_dir.resolve()
+        safe_path = get_safe_path(target_dir, path)
+        if not safe_path.exists():
+            return f"Error: File '{path}' does not exist."
+        if not safe_path.is_file():
+            return f"Error: Path '{path}' is not a file."
+
+        safe_path.unlink()
+        return f"Successfully deleted file '{path}'."
+    except Exception as e:
+        return f"Error deleting file: {str(e)}"
+
+def tool_move_file(target_dir: Path, src: str, dst: str) -> str:
+    try:
+        target_dir = target_dir.resolve()
+        safe_src = get_safe_path(target_dir, src)
+        safe_dst = get_safe_path(target_dir, dst)
+
+        if not safe_src.exists():
+            return f"Error: Source '{src}' does not exist."
+
+        safe_dst.parent.mkdir(parents=True, exist_ok=True)
+        safe_src.rename(safe_dst)
+
+        return f"Successfully moved '{src}' to '{dst}'."
+    except Exception as e:
+        return f"Error moving file: {str(e)}"
+
 def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
     if TUI_MODE: return
     """Print the tool execution beautifully in the console."""
@@ -238,9 +282,11 @@ def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
             else:
                 table.add_row("", line)
         console.print(table)
-    elif tool_name in ["read_file", "write_file"]:
+    elif tool_name in ["read_file", "write_file", "patch_file"]:
         lexer = "python"
-        if args_info.endswith(".json"): lexer = "json"
+        if tool_name == "patch_file":
+            lexer = "diff"
+        elif args_info.endswith(".json"): lexer = "json"
         elif args_info.endswith(".md"): lexer = "markdown"
         elif args_info.endswith(".html"): lexer = "html"
         elif args_info.endswith(".css"): lexer = "css"
@@ -253,11 +299,36 @@ def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
         else:
             preview_content = result
             
-        console.print(Panel(Syntax(preview_content, lexer, theme="monokai", line_numbers=True), title=f"File Content: {args_info}", border_style="green"))
+        line_numbers = tool_name != "patch_file"
+        console.print(Panel(Syntax(preview_content, lexer, theme="monokai", line_numbers=line_numbers), title=f"File Content: {args_info}", border_style="green"))
     else:
         console.print(Panel(result, border_style="cyan", title="Tool Result"))
 
 def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str] = None, subagent_runner=None) -> list[dict]:
+def ask_user_confirmation(tool_name: str, path: str, preview: str) -> bool:
+    if _YOLO_MODE:
+        return True
+
+    title = f"{tool_name} on '{path}'"
+    if not TUI_MODE:
+        console.print(Panel(Syntax(preview, "python", theme="monokai"), title=f"Preview: {title}", border_style="yellow"))
+        return Confirm.ask(f"[bold yellow]Allow {tool_name} on {path}?[/bold yellow]")
+
+    # TUI Mode
+    result_event = threading.Event()
+    user_decision = []
+
+    def on_dismiss(result: bool):
+        user_decision.append(result)
+        result_event.set()
+
+    screen = ConfirmationScreen(title, preview)
+    _APP_INSTANCE.call_from_thread(_APP_INSTANCE.push_screen, screen, on_dismiss)
+
+    result_event.wait()
+    return user_decision[0] if user_decision else False
+
+def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
     """Parse XML tags in response and execute tools in the order they appear."""
     matches = []
     
@@ -276,6 +347,12 @@ def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str
     for m in re.finditer(r"<spawn_agent\s+name=([\"']?)(.*?)\1[^>]*>(.*?)</spawn_agent\s*>", text, re.DOTALL):
         matches.append((m.start(), "spawn_agent", m))
         
+    for m in re.finditer(r"<delete_file>(.*?)</delete_file\s*>", text, re.DOTALL):
+        matches.append((m.start(), "delete_file", m))
+
+    for m in re.finditer(r"<move_file\s+src=([\"']?)(.*?)\1\s+dst=([\"']?)(.*?)\3\s*/>", text, re.DOTALL):
+        matches.append((m.start(), "move_file", m))
+
     matches.sort(key=lambda x: x[0])
     
     results = []
@@ -303,6 +380,11 @@ def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str
             content = m.group(3)
             if content.startswith("\n"):
                 content = content[1:]
+
+            if not ask_user_confirmation("write_file", path, content):
+                results.append({"tool": "write_file", "path": path, "result": "Error: User denied permission to write file."})
+                continue
+
             res = tool_write_file(target_dir, path, content)
             format_and_print_tool_call("write_file", path, res)
             results.append({"tool": "write_file", "path": path, "result": res})
@@ -315,6 +397,12 @@ def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str
                 search = search[1:]
             if replace.startswith("\n"):
                 replace = replace[1:]
+
+            preview = f"Search:\n{search}\n\nReplace:\n{replace}"
+            if not ask_user_confirmation("patch_file", path, preview):
+                results.append({"tool": "patch_file", "path": path, "result": "Error: User denied permission to patch file."})
+                continue
+
             res = tool_patch_file(target_dir, path, search, replace)
             format_and_print_tool_call("patch_file", path, res)
             results.append({"tool": "patch_file", "path": path, "result": res})
@@ -328,6 +416,18 @@ def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str
                 res = subagent_runner(name, task)
             format_and_print_tool_call("spawn_agent", name, res)
             results.append({"tool": "spawn_agent", "path": name, "result": res})
+        elif tag_type == "delete_file":
+            path = m.group(1).strip()
+            res = tool_delete_file(target_dir, path)
+            format_and_print_tool_call("delete_file", path, res)
+            results.append({"tool": "delete_file", "path": path, "result": res})
+
+        elif tag_type == "move_file":
+            src = m.group(2).strip()
+            dst = m.group(4).strip()
+            res = tool_move_file(target_dir, src, dst)
+            format_and_print_tool_call("move_file", f"src='{src}' dst='{dst}'", res)
+            results.append({"tool": "move_file", "path": f"{src} -> {dst}", "result": res})
 
     return results
 
@@ -727,6 +827,56 @@ class DownloadModelScreen(ModalScreen):
             self.app.call_from_thread(status.update, f"Error: {e}")
             self.app.call_from_thread(self.query_one("#cancel-btn").__setattr__, "disabled", False)
 
+class ConfirmationScreen(ModalScreen[bool]):
+    CSS = """
+    ConfirmationScreen {
+        align: center middle;
+    }
+    #confirm-dialog {
+        padding: 1 2;
+        width: 80%;
+        height: auto;
+        border: thick $background 80%;
+        background: $surface;
+    }
+    #preview-scroll {
+        height: 1fr;
+        max-height: 20;
+        border: solid $primary;
+        margin: 1 0;
+    }
+    """
+
+    BINDINGS = [
+        ("y", "confirm(True)", "Yes (Approve)"),
+        ("n", "confirm(False)", "No (Deny)"),
+    ]
+
+    def __init__(self, title: str, preview: str):
+        super().__init__()
+        self.dialog_title = title
+        self.preview_content = preview
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Label(f"[bold yellow]Requires Permission:[/bold yellow] {self.dialog_title}")
+            with VerticalScroll(id="preview-scroll"):
+                yield Static(self.preview_content)
+            yield Label("Press [bold green]'y'[/bold green] to allow, or [bold red]'n'[/bold red] to deny.")
+            with Horizontal():
+                yield Button("Yes (y)", variant="success", id="btn-yes")
+                yield Button("No (n)", variant="error", id="btn-no")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-yes":
+            self.dismiss(True)
+        elif event.button.id == "btn-no":
+            self.dismiss(False)
+
+    def action_confirm(self, result: bool) -> None:
+        self.dismiss(result)
+
+
 class ServeModelScreen(ModalScreen):
     CSS = """
     ServeModelScreen {
@@ -827,10 +977,11 @@ class ServeModelScreen(ModalScreen):
 
 
 class ChatMessage(Static):
-    def __init__(self, text: str, role: str):
+    def __init__(self, text: str, role: str, is_diff: bool = False):
         super().__init__()
         self.text = text
         self.role = role
+        self.is_diff = is_diff
 
     def render(self):
         if self.role == "user":
@@ -838,7 +989,8 @@ class ChatMessage(Static):
         elif self.role == "assistant":
             return Panel(Markdown(self.text), title="Assistant", border_style="blue", expand=False)
         else: # System or tool
-            return Panel(self.text, title=self.role.capitalize(), border_style="yellow", expand=False)
+            content = Syntax(self.text, "diff", theme="monokai", line_numbers=False) if self.is_diff else self.text
+            return Panel(content, title=self.role.capitalize(), border_style="yellow", expand=False)
 
 class StreamMessage(Static):
     """A chat widget that accumulates streamed text and re-renders it on demand."""
@@ -1009,7 +1161,8 @@ class LocalCoderApp(App):
 
                 for tr in tool_results:
                     # Show tool result in UI
-                    self.call_from_thread(self.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr['path']}:\n{tr['result']}", "system"))
+                    is_diff = tr['tool'] == 'patch_file'
+                    self.call_from_thread(self.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr['path']}:\n{tr['result']}", "system", is_diff=is_diff))
 
                 result_message = build_tool_result_message(tool_results)
                 self.messages.append({"role": "user", "content": result_message, "is_tool_result": True})
@@ -1034,10 +1187,16 @@ def main():
     parser.add_argument("--agent", action="store_true", help="Enable autonomous agent loop with filesystem tools")
     parser.add_argument("--max-iterations", type=int, default=10, help="Maximum number of loop iterations for agent mode")
     parser.add_argument("-i", "--interactive", action="store_true", help="Force launch the interactive REPL shell")
+    parser.add_argument("--yolo", action="store_true", help="Auto-approve destructive operations (no prompts)")
+    parser.add_argument("--auto-approve", action="store_true", help="Alias for --yolo")
     parser.add_argument("prompt", nargs="?", help="The programming task / instruction for the LLM")
     
     args = parser.parse_args()
     
+    global _YOLO_MODE
+    if args.yolo or args.auto_approve:
+        _YOLO_MODE = True
+
     provider, api_url, api_key, model = resolve_provider_config(
         args.provider, args.api_url, args.api_key, args.model
     )
@@ -1074,9 +1233,10 @@ def main():
     
 
     if is_interactive:
-        global TUI_MODE
+        global TUI_MODE, _APP_INSTANCE
         TUI_MODE = True
         app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations)
+        _APP_INSTANCE = app
         app.run()
     else:
         messages.append({"role": "user", "content": args.prompt})
