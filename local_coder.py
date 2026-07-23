@@ -37,6 +37,7 @@ _SHOW_IGNORED = False
 _MAX_HISTORY = 20
 _SESSION_FILE = None
 _ALLOWED_TOOLS = None
+_TOOL_MODE = "auto"
 _APP_INSTANCE = None
 
 MODELS_PRESETS = {
@@ -497,6 +498,212 @@ def tool_move_file(target_dir: Path, src: str, dst: str) -> str:
     except Exception as e:
         return f"Error moving file: {str(e)}"
 
+TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "Lists files and folders inside the target directory. .gitignore-matched entries and .git are hidden unless show_ignored is true.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory to list, relative to the target directory ('.' for root)."},
+                    "show_ignored": {"type": "boolean", "description": "Include .gitignore-matched and .git entries. Defaults to false."}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Reads the full content of a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "File to read, relative to the target directory."}},
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_files",
+            "description": "Searches for a regular expression in a file or all files in a directory. Capped at 200 matches.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regular expression to search for."},
+                    "path": {"type": "string", "description": "File or directory to search, relative to the target directory ('.' for root)."}
+                },
+                "required": ["pattern"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Creates a new file or completely overwrites an existing file. Asks the user for confirmation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File to write, relative to the target directory."},
+                    "content": {"type": "string", "description": "Content to write to the file."}
+                },
+                "required": ["path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "patch_file",
+            "description": "Modifies part of an existing file by replacing an exact search block with a replacement. Asks the user for confirmation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File to patch, relative to the target directory."},
+                    "search": {"type": "string", "description": "Exact text to search for."},
+                    "replace": {"type": "string", "description": "Replacement text."}
+                },
+                "required": ["path", "search", "replace"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": "Deletes an existing file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "File to delete, relative to the target directory."}},
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_file",
+            "description": "Moves or renames a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string", "description": "Source path, relative to the target directory."},
+                    "dst": {"type": "string", "description": "Destination path, relative to the target directory."}
+                },
+                "required": ["src", "dst"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Executes a shell command in the target directory. Asks the user for confirmation. 30s timeout.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string", "description": "Shell command to run."}},
+                "required": ["command"]
+            }
+        }
+    }
+]
+
+def execute_native_tools(target_dir: Path, tool_calls: list[dict], allowed_tools: list[str] = None) -> list[dict]:
+    """Execute native JSON tool calls, applying the same confirmation gates and
+    allowed_tools filtering as the XML dispatch path in parse_and_execute_tools."""
+    results = []
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        tool_name = func.get("name")
+        tool_id = tc.get("id")
+        args_str = func.get("arguments", "{}")
+
+        try:
+            args = json.loads(args_str) if args_str else {}
+        except json.JSONDecodeError:
+            results.append({"tool": tool_name, "id": tool_id, "path": "N/A", "result": f"Error: Invalid JSON arguments: {args_str}"})
+            continue
+
+        if allowed_tools is not None and tool_name not in allowed_tools:
+            res = f"Error: Tool '{tool_name}' is not permitted by this agent's configuration."
+            format_and_print_tool_call(tool_name or "unknown", "N/A", res)
+            results.append({"tool": tool_name, "id": tool_id, "path": "N/A", "result": res})
+            continue
+
+        if tool_name == "list_dir":
+            path = args.get("path", ".")
+            show_ignored = args.get("show_ignored", _SHOW_IGNORED)
+            res = tool_list_dir(target_dir, path, show_ignored=show_ignored)
+            format_and_print_tool_call("list_dir", path, res)
+            results.append({"tool": "list_dir", "id": tool_id, "path": path, "result": res})
+
+        elif tool_name == "read_file":
+            path = args.get("path", "")
+            res = tool_read_file(target_dir, path)
+            format_and_print_tool_call("read_file", path, res)
+            results.append({"tool": "read_file", "id": tool_id, "path": path, "result": res})
+
+        elif tool_name == "search_files":
+            path = args.get("path", ".")
+            pattern = args.get("pattern", "")
+            res = tool_search_files(target_dir, pattern, path)
+            format_and_print_tool_call("search_files", f"path='{path}', pattern='{pattern}'", res)
+            results.append({"tool": "search_files", "id": tool_id, "path": path, "result": res})
+
+        elif tool_name == "write_file":
+            path = args.get("path", "")
+            content = args.get("content", "")
+            if not ask_user_confirmation("write_file", path, content):
+                results.append({"tool": "write_file", "id": tool_id, "path": path, "result": "Error: User denied permission to write file."})
+                continue
+            res = tool_write_file(target_dir, path, content)
+            format_and_print_tool_call("write_file", path, res)
+            results.append({"tool": "write_file", "id": tool_id, "path": path, "result": res})
+
+        elif tool_name == "patch_file":
+            path = args.get("path", "")
+            search = args.get("search", "")
+            replace = args.get("replace", "")
+            preview = f"Search:\n{search}\n\nReplace:\n{replace}"
+            if not ask_user_confirmation("patch_file", path, preview):
+                results.append({"tool": "patch_file", "id": tool_id, "path": path, "result": "Error: User denied permission to patch file."})
+                continue
+            res = tool_patch_file(target_dir, path, search, replace)
+            format_and_print_tool_call("patch_file", path, res)
+            results.append({"tool": "patch_file", "id": tool_id, "path": path, "result": res})
+
+        elif tool_name == "delete_file":
+            path = args.get("path", "")
+            res = tool_delete_file(target_dir, path)
+            format_and_print_tool_call("delete_file", path, res)
+            results.append({"tool": "delete_file", "id": tool_id, "path": path, "result": res})
+
+        elif tool_name == "move_file":
+            src = args.get("src", "")
+            dst = args.get("dst", "")
+            res = tool_move_file(target_dir, src, dst)
+            format_and_print_tool_call("move_file", f"src='{src}' dst='{dst}'", res)
+            results.append({"tool": "move_file", "id": tool_id, "path": f"{src} -> {dst}", "result": res})
+
+        elif tool_name == "run_command":
+            command = args.get("command", "")
+            if not ask_user_confirmation("run_command", "shell", command):
+                results.append({"tool": "run_command", "id": tool_id, "path": ".", "result": "Error: User denied command execution."})
+                continue
+            res = tool_run_command(target_dir, command)
+            format_and_print_tool_call("run_command", command, res)
+            results.append({"tool": "run_command", "id": tool_id, "path": ".", "result": res})
+
+        else:
+            results.append({"tool": tool_name, "id": tool_id, "path": "N/A", "result": f"Error: Unknown tool '{tool_name}'"})
+
+    return results
+
 def tool_run_command(target_dir: Path, command: str) -> str:
     try:
         target_dir = target_dir.resolve()
@@ -766,15 +973,27 @@ def compact_old_tool_results(messages: list[dict], keep_last: int = 1) -> None:
     accumulated bytes. Older results are already reflected in the model's own
     replies, so only the most recent `keep_last` need to stay verbatim.
     """
-    indices = [
-        i for i, m in enumerate(messages)
-        if m.get("role") == "user" and m.get("is_tool_result", False)
-    ]
-    for i in indices[:-keep_last] if keep_last else indices:
-        content = messages[i]["content"]
-        messages[i]["content"] = (
-            f"[Tool result omitted to save context — {len(content)} chars, already processed by the agent]"
-        )
+    # Group into contiguous blocks so a native tool-calling turn (one or more
+    # role="tool" messages sharing an assistant turn) is compacted as a unit,
+    # same as an XML turn's single role="user"/is_tool_result message.
+    tool_blocks = []
+    current_block = []
+    for i, m in enumerate(messages):
+        is_tool = m.get("role") == "tool" or (m.get("role") == "user" and m.get("is_tool_result", False))
+        if is_tool:
+            current_block.append(i)
+        elif current_block:
+            tool_blocks.append(current_block)
+            current_block = []
+    if current_block:
+        tool_blocks.append(current_block)
+
+    for block in tool_blocks[:-keep_last] if keep_last else tool_blocks:
+        for i in block:
+            content = messages[i]["content"]
+            messages[i]["content"] = (
+                f"[Tool result omitted to save context — {len(content)} chars, already processed by the agent]"
+            )
 
 def trim_messages_context(messages: list[dict], max_history: int = 20) -> None:
     """Trim the actual list of messages to prevent LLM context limit errors.
@@ -792,43 +1011,83 @@ def trim_messages_context(messages: list[dict], max_history: int = 20) -> None:
 
 class StreamInterrupted(Exception):
     """Raised when a user interrupts an in-progress stream (console mode only)."""
-    def __init__(self, partial_text: str):
+    def __init__(self, partial_text: str, tool_calls: list = None):
         super().__init__("Streaming interrupted by user")
         self.partial_text = partial_text
+        self.tool_calls = tool_calls or []
 
-def stream_completion(client: OpenAI, model: str, messages: list[dict], on_update, throttle_every: int = 20) -> str:
+def stream_completion(client: OpenAI, model: str, messages: list[dict], on_update, throttle_every: int = 20, tool_mode: str = "xml"):
     """Stream one chat completion, calling on_update(accumulated_text) at a throttled cadence.
 
     This is the single place that accumulates chunks and applies bounds-checking/
     throttling; both console and TUI front-ends (single-shot and agent-loop modes)
     drive it with a different on_update callback rather than re-implementing the
     accumulation loop.
+
+    Always returns (text, tool_calls). tool_calls is [] unless tool_mode is
+    "functions" or "auto", in which case TOOLS_SCHEMA is offered to the model
+    and any native function calls it makes are accumulated and returned
+    alongside the text. tool_mode="xml" (the default here, used internally by
+    run_subagent) never requests native tools - callers that want them must
+    opt in explicitly.
     """
     parts = []
     chunk_count = 0
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.2,
-        stream=True,
-        timeout=120.0
-    )
+    tool_calls_dict = {}
+
+    kwargs = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        "stream": True,
+        "timeout": 120.0
+    }
+    if tool_mode in ("functions", "auto"):
+        kwargs["tools"] = TOOLS_SCHEMA
+
+    response = client.chat.completions.create(**kwargs)
     try:
         for chunk in response:
-            if chunk.choices and chunk.choices[0].delta.content:
-                content = chunk.choices[0].delta.content
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta.content:
+                content = delta.content
                 parts.append(content)
                 chunk_count += 1
                 if chunk_count % throttle_every == 0 or "\n" in content:
                     on_update("".join(parts))
+
+            if getattr(delta, "tool_calls", None):
+                for tc_chunk in delta.tool_calls:
+                    idx = tc_chunk.index
+                    if idx not in tool_calls_dict:
+                        tool_calls_dict[idx] = {
+                            "id": tc_chunk.id or "",
+                            "type": tc_chunk.type or "function",
+                            "function": {
+                                "name": (tc_chunk.function.name or "") if tc_chunk.function else "",
+                                "arguments": (tc_chunk.function.arguments or "") if tc_chunk.function else ""
+                            }
+                        }
+                    else:
+                        if tc_chunk.id:
+                            tool_calls_dict[idx]["id"] += tc_chunk.id
+                        if tc_chunk.function:
+                            if tc_chunk.function.name:
+                                tool_calls_dict[idx]["function"]["name"] += tc_chunk.function.name
+                            if tc_chunk.function.arguments:
+                                tool_calls_dict[idx]["function"]["arguments"] += tc_chunk.function.arguments
     except KeyboardInterrupt:
         partial_text = "".join(parts)
         on_update(partial_text)
-        raise StreamInterrupted(partial_text)
+        tool_calls_list = [v for _, v in sorted(tool_calls_dict.items())]
+        raise StreamInterrupted(partial_text, tool_calls_list)
 
     full_text = "".join(parts)
     on_update(full_text)
-    return full_text
+    tool_calls_list = [v for _, v in sorted(tool_calls_dict.items())]
+    return full_text, tool_calls_list
 
 def build_tool_result_message(tool_results: list[dict]) -> str:
     parts = [
@@ -876,12 +1135,12 @@ def run_subagent(client: OpenAI, model: str, target_dir: Path, agent_name: str, 
                     tui_app.call_from_thread(_stream_msg.update_content, text)
                     tui_app.call_from_thread(tui_app.chat_history.scroll_end, animate=False)
 
-                assistant_response = stream_completion(client, model, messages, on_update_tui)
+                assistant_response, _ = stream_completion(client, model, messages, on_update_tui)
             else:
                 with Live(console=console, refresh_per_second=8) as live:
                     def on_update_cli(text):
                         live.update(Panel(Markdown(text), title=f"[bold green]Subagent '{agent_name}' (Step {i})[/bold green]", border_style="magenta"))
-                    assistant_response = stream_completion(client, model, messages, on_update_cli)
+                    assistant_response, _ = stream_completion(client, model, messages, on_update_cli)
         except StreamInterrupted as e:
             if not tui_app:
                 console.print(f"[bold yellow]{prefix}Generation interrupted by user.[/bold yellow]")
@@ -941,12 +1200,12 @@ def run_subagent(client: OpenAI, model: str, target_dir: Path, agent_name: str, 
                 tui_app.call_from_thread(_stream_msg.update_content, text)
                 tui_app.call_from_thread(tui_app.chat_history.scroll_end, animate=False)
 
-            summary_response = stream_completion(client, model, messages, on_update_summary_tui)
+            summary_response, _ = stream_completion(client, model, messages, on_update_summary_tui)
         else:
             with Live(console=console, refresh_per_second=8) as live:
                 def on_update_summary_cli(text):
                     live.update(Panel(Markdown(text), title=f"[bold green]Subagent '{agent_name}' Summary[/bold green]", border_style="magenta"))
-                summary_response = stream_completion(client, model, messages, on_update_summary_cli)
+                summary_response, _ = stream_completion(client, model, messages, on_update_summary_cli)
     except Exception as e:
         summary_response = f"Error generating summary: {e}"
 
@@ -960,36 +1219,47 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
         console.print(f"\n[bold blue]🤖 Agent Thinking (Step {i}/{max_iterations}) ...[/bold blue]")
 
         assistant_response = ""
+        assistant_tool_calls = []
         try:
             with Live(console=console, refresh_per_second=8) as live:
                 def on_update(text):
                     live.update(Panel(Markdown(text), title=f"[bold green]Assistant (Step {i})[/bold green]", border_style="blue"))
-                assistant_response = stream_completion(client, model, messages, on_update)
+                assistant_response, assistant_tool_calls = stream_completion(client, model, messages, on_update, tool_mode=_TOOL_MODE)
         except StreamInterrupted as e:
             console.print("\n[bold yellow]Generation interrupted by user.[/bold yellow]")
             assistant_response = e.partial_text
-            if not assistant_response:
+            assistant_tool_calls = e.tool_calls
+            if not assistant_response and not assistant_tool_calls:
                 break
         except Exception as e:
             console.print(f"[bold red]API call failed:[/bold red] {e}")
             break
 
-        if not assistant_response:
+        if not assistant_response and not assistant_tool_calls:
             console.print("[bold red]Received empty response from the model.[/bold red]")
             break
 
-        messages.append({"role": "assistant", "content": assistant_response})
+        assistant_message = {"role": "assistant", "content": assistant_response}
+        if assistant_tool_calls:
+            assistant_message["tool_calls"] = assistant_tool_calls
+        messages.append(assistant_message)
         save_session(_SESSION_FILE, messages)
 
-        tool_results = parse_and_execute_tools(target_dir, assistant_response, allowed_tools=_ALLOWED_TOOLS, subagent_runner=subagent_runner_callable)
+        if assistant_tool_calls:
+            tool_results = execute_native_tools(target_dir, assistant_tool_calls, allowed_tools=_ALLOWED_TOOLS)
+            for tr in tool_results:
+                messages.append({"role": "tool", "tool_call_id": tr["id"], "content": tr["result"]})
+        else:
+            tool_results = parse_and_execute_tools(target_dir, assistant_response, allowed_tools=_ALLOWED_TOOLS, subagent_runner=subagent_runner_callable)
 
-        if not tool_results:
-            console.print("[bold green]✔ No tools triggered or task complete.[/bold green]")
-            break
+            if not tool_results:
+                console.print("[bold green]✔ No tools triggered or task complete.[/bold green]")
+                break
 
-        result_message = build_tool_result_message(tool_results)
-        console.print(f"[bold cyan]Sending tool results back to LLM...[/bold cyan]")
-        messages.append({"role": "user", "content": result_message, "is_tool_result": True})
+            result_message = build_tool_result_message(tool_results)
+            console.print(f"[bold cyan]Sending tool results back to LLM...[/bold cyan]")
+            messages.append({"role": "user", "content": result_message, "is_tool_result": True})
+
         compact_old_tool_results(messages)
         trim_messages_context(messages, _MAX_HISTORY)
         save_session(_SESSION_FILE, messages)
@@ -1002,7 +1272,7 @@ def run_single_prompt(client: OpenAI, model: str, messages: list[dict]):
         with Live(console=console, refresh_per_second=8) as live:
             def on_update(text):
                 live.update(Panel(Markdown(text), title="Assistant Response", border_style="blue"))
-            assistant_response = stream_completion(client, model, messages, on_update)
+            assistant_response, _ = stream_completion(client, model, messages, on_update)
         messages.append({"role": "assistant", "content": assistant_response})
         save_session(_SESSION_FILE, messages)
     except StreamInterrupted as e:
@@ -1523,7 +1793,7 @@ class LocalCoderApp(App):
             self.call_from_thread(self.chat_history.scroll_end, animate=False)
 
         try:
-            assistant_response = stream_completion(self.client, self.model, self.messages, on_update)
+            assistant_response, _ = stream_completion(self.client, self.model, self.messages, on_update)
             self.call_from_thread(self._trim_chat_history)
             self.messages.append({"role": "assistant", "content": assistant_response})
             save_session(_SESSION_FILE, self.messages)
@@ -1548,26 +1818,36 @@ class LocalCoderApp(App):
                     self.call_from_thread(_stream_msg.update_content, text)
                     self.call_from_thread(self.chat_history.scroll_end, animate=False)
 
-                assistant_response = stream_completion(self.client, self.model, self.messages, on_update)
+                assistant_response, assistant_tool_calls = stream_completion(self.client, self.model, self.messages, on_update, tool_mode=_TOOL_MODE)
 
-                self.messages.append({"role": "assistant", "content": assistant_response})
+                assistant_message = {"role": "assistant", "content": assistant_response}
+                if assistant_tool_calls:
+                    assistant_message["tool_calls"] = assistant_tool_calls
+                self.messages.append(assistant_message)
                 save_session(_SESSION_FILE, self.messages)
 
-                # Execute tools
-                tool_results = parse_and_execute_tools(self.target_dir, assistant_response, allowed_tools=_ALLOWED_TOOLS, subagent_runner=subagent_runner_callable)
+                if assistant_tool_calls:
+                    tool_results = execute_native_tools(self.target_dir, assistant_tool_calls, allowed_tools=_ALLOWED_TOOLS)
+                    for tr in tool_results:
+                        self.messages.append({"role": "tool", "tool_call_id": tr["id"], "content": tr["result"]})
+                        self.call_from_thread(self.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr.get('path', '')}:\n{tr['result']}", "system"))
+                else:
+                    # Execute tools
+                    tool_results = parse_and_execute_tools(self.target_dir, assistant_response, allowed_tools=_ALLOWED_TOOLS, subagent_runner=subagent_runner_callable)
 
-                if not tool_results:
-                    self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))
-                    self.call_after_refresh(self.chat_history.scroll_end, animate=False)
-                    break
+                    if not tool_results:
+                        self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))
+                        self.call_after_refresh(self.chat_history.scroll_end, animate=False)
+                        break
 
-                for tr in tool_results:
-                    # Show tool result in UI
-                    is_diff = tr['tool'] == 'patch_file'
-                    self.call_from_thread(self.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr['path']}:\n{tr['result']}", "system", is_diff=is_diff))
+                    for tr in tool_results:
+                        # Show tool result in UI
+                        is_diff = tr['tool'] == 'patch_file'
+                        self.call_from_thread(self.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr['path']}:\n{tr['result']}", "system", is_diff=is_diff))
 
-                result_message = build_tool_result_message(tool_results)
-                self.messages.append({"role": "user", "content": result_message, "is_tool_result": True})
+                    result_message = build_tool_result_message(tool_results)
+                    self.messages.append({"role": "user", "content": result_message, "is_tool_result": True})
+
                 compact_old_tool_results(self.messages)
                 trim_messages_context(self.messages, _MAX_HISTORY)
                 save_session(_SESSION_FILE, self.messages)
@@ -1600,16 +1880,18 @@ def main():
     parser.add_argument("--list-agents", action="store_true", help="List all available agent profiles (built-in and project-local) and exit")
     parser.add_argument("--create-agent", type=str, help="Scaffold a new agent profile JSON in .local-coder/agents/ with the given name")
     parser.add_argument("--agent-profile", type=str, help="Launch the main agent with a specific profile (overrides --system-prompt, forces --agent)")
+    parser.add_argument("--tool-mode", choices=["xml", "functions", "auto"], default="auto", help="Tool-calling protocol: xml (legacy tags), functions (native only), or auto (offer native, model may still use XML). Only affects --agent mode.")
     parser.add_argument("prompt", nargs="?", help="The programming task / instruction for the LLM")
 
     args = parser.parse_args()
 
-    global _YOLO_MODE, _SHOW_IGNORED, _MAX_HISTORY
+    global _YOLO_MODE, _SHOW_IGNORED, _MAX_HISTORY, _TOOL_MODE
     if args.yolo or args.auto_approve:
         _YOLO_MODE = True
     if args.show_ignored:
         _SHOW_IGNORED = True
     _MAX_HISTORY = args.max_history
+    _TOOL_MODE = args.tool_mode
 
     provider, api_url, api_key, model = resolve_provider_config(
         args.provider, args.api_url, args.api_key, args.model

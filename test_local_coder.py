@@ -254,6 +254,103 @@ class TestLocalCoder(unittest.TestCase):
         self.assertTrue(m_dir.exists())
         self.assertTrue(m_dir.is_dir())
 
+    def test_execute_native_tools(self):
+        local_coder._YOLO_MODE = True
+        try:
+            tool_calls = [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": json.dumps({"path": "script_native.py", "content": "print('Hello Native')\n"})
+                    }
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "script_native.py"})
+                    }
+                },
+                {
+                    "id": "call_3",
+                    "type": "function",
+                    "function": {"name": "nonexistent_tool", "arguments": "{}"}
+                },
+                {
+                    "id": "call_4",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "not json"}
+                }
+            ]
+
+            results = local_coder.execute_native_tools(self.test_dir, tool_calls)
+
+            self.assertEqual(results[0]["id"], "call_1")
+            self.assertEqual(results[0]["tool"], "write_file")
+            self.assertIn("Successfully wrote", results[0]["result"])
+
+            self.assertEqual(results[1]["id"], "call_2")
+            self.assertEqual(results[1]["result"], "print('Hello Native')\n")
+
+            self.assertIn("Unknown tool", results[2]["result"])
+
+            self.assertIn("Invalid JSON arguments", results[3]["result"])
+        finally:
+            local_coder._YOLO_MODE = False
+
+    def test_execute_native_tools_confirmation_and_filtering(self):
+        from unittest.mock import patch
+
+        # Confirmation denied
+        tool_calls = [{"id": "c1", "function": {"name": "write_file", "arguments": json.dumps({"path": "x.txt", "content": "y"})}}]
+        with patch("local_coder.Confirm.ask", return_value=False):
+            results = local_coder.execute_native_tools(self.test_dir, tool_calls)
+        self.assertIn("User denied permission", results[0]["result"])
+        self.assertFalse((self.test_dir / "x.txt").exists())
+
+        # allowed_tools filtering
+        tool_calls = [{"id": "c2", "function": {"name": "write_file", "arguments": "{}"}}]
+        results = local_coder.execute_native_tools(self.test_dir, tool_calls, allowed_tools=["read_file"])
+        self.assertIn("not permitted", results[0]["result"])
+
+    def test_stream_completion_native_tool_call_accumulation(self):
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        def make_chunk(content=None, tool_call_delta=None):
+            delta = SimpleNamespace(content=content, tool_calls=None)
+            if tool_call_delta:
+                delta.tool_calls = [SimpleNamespace(**tool_call_delta)]
+            return SimpleNamespace(choices=[SimpleNamespace(delta=delta)])
+
+        chunks = [
+            make_chunk(tool_call_delta={
+                "index": 0, "id": "call_abc", "type": "function",
+                "function": SimpleNamespace(name="read_file", arguments="")
+            }),
+            make_chunk(tool_call_delta={
+                "index": 0, "id": "", "type": "function",
+                "function": SimpleNamespace(name="", arguments='{"path": "a.txt"}')
+            }),
+        ]
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = iter(chunks)
+
+        text, tool_calls = local_coder.stream_completion(fake_client, "model", [], lambda t: None, tool_mode="functions")
+        self.assertEqual(text, "")
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["id"], "call_abc")
+        self.assertEqual(tool_calls[0]["function"]["name"], "read_file")
+        self.assertEqual(tool_calls[0]["function"]["arguments"], '{"path": "a.txt"}')
+
+        # tools schema should have been offered to the model
+        call_kwargs = fake_client.chat.completions.create.call_args.kwargs
+        self.assertIn("tools", call_kwargs)
+
     def test_tool_run_command(self):
         res = local_coder.tool_run_command(self.test_dir, "echo 'hello world'")
         self.assertIn("hello world", res)
