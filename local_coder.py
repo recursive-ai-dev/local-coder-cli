@@ -356,28 +356,38 @@ def build_tool_result_message(tool_results: list[dict]) -> str:
     ]
     return "\n".join(parts)
 
-def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int):
-    """Executes the agentic reasoning & execution loop with live updates."""
+def core_agent_loop(
+    target_dir: Path,
+    messages: list[dict],
+    max_iterations: int,
+    emit_step_start,
+    execute_stream,
+    emit_stream_interrupted,
+    emit_error,
+    emit_empty_response,
+    emit_no_tools,
+    emit_tool_results,
+    emit_sending_results,
+    post_step_action=None
+):
+    """Core iteration logic for the agent loop, decoupled from UI."""
     for i in range(1, max_iterations + 1):
-        console.print(f"\n[bold blue]🤖 Agent Thinking (Step {i}/{max_iterations}) ...[/bold blue]")
+        emit_step_start(i, max_iterations)
 
         assistant_response = ""
         try:
-            with Live(console=console, refresh_per_second=8) as live:
-                def on_update(text):
-                    live.update(Panel(Markdown(text), title=f"[bold green]Assistant (Step {i})[/bold green]", border_style="blue"))
-                assistant_response = stream_completion(client, model, messages, on_update)
+            assistant_response = execute_stream(i)
         except StreamInterrupted as e:
-            console.print("\n[bold yellow]Generation interrupted by user.[/bold yellow]")
+            emit_stream_interrupted(e)
             assistant_response = e.partial_text
             if not assistant_response:
                 break
         except Exception as e:
-            console.print(f"[bold red]API call failed:[/bold red] {e}")
+            emit_error(e)
             break
 
         if not assistant_response:
-            console.print("[bold red]Received empty response from the model.[/bold red]")
+            emit_empty_response()
             break
 
         messages.append({"role": "assistant", "content": assistant_response})
@@ -385,15 +395,64 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
         tool_results = parse_and_execute_tools(target_dir, assistant_response)
 
         if not tool_results:
-            console.print("[bold green]✔ No tools triggered or task complete.[/bold green]")
+            emit_no_tools()
             break
 
+        emit_tool_results(tool_results)
+
         result_message = build_tool_result_message(tool_results)
-        console.print(f"[bold cyan]Sending tool results back to LLM...[/bold cyan]")
+        emit_sending_results()
         messages.append({"role": "user", "content": result_message, "is_tool_result": True})
         compact_old_tool_results(messages)
 
+        if post_step_action:
+            post_step_action()
+
     return messages
+
+def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int):
+    """Executes the agentic reasoning & execution loop with live updates."""
+
+    def emit_step_start(step: int, max_iters: int):
+        console.print(f"\n[bold blue]🤖 Agent Thinking (Step {step}/{max_iters}) ...[/bold blue]")
+
+    def execute_stream(step: int) -> str:
+        with Live(console=console, refresh_per_second=8) as live:
+            def on_update(text):
+                live.update(Panel(Markdown(text), title=f"[bold green]Assistant (Step {step})[/bold green]", border_style="blue"))
+            return stream_completion(client, model, messages, on_update)
+
+    def emit_stream_interrupted(e: StreamInterrupted):
+        console.print("\n[bold yellow]Generation interrupted by user.[/bold yellow]")
+
+    def emit_error(e: Exception):
+        console.print(f"[bold red]API call failed:[/bold red] {e}")
+
+    def emit_empty_response():
+        console.print("[bold red]Received empty response from the model.[/bold red]")
+
+    def emit_no_tools():
+        console.print("[bold green]✔ No tools triggered or task complete.[/bold green]")
+
+    def emit_tool_results(tool_results: list[dict]):
+        pass  # Handled by format_and_print_tool_call inside parse_and_execute_tools
+
+    def emit_sending_results():
+        console.print(f"[bold cyan]Sending tool results back to LLM...[/bold cyan]")
+
+    return core_agent_loop(
+        target_dir=target_dir,
+        messages=messages,
+        max_iterations=max_iterations,
+        emit_step_start=emit_step_start,
+        execute_stream=execute_stream,
+        emit_stream_interrupted=emit_stream_interrupted,
+        emit_error=emit_error,
+        emit_empty_response=emit_empty_response,
+        emit_no_tools=emit_no_tools,
+        emit_tool_results=emit_tool_results,
+        emit_sending_results=emit_sending_results
+    )
 
 def run_single_prompt(client: OpenAI, model: str, messages: list[dict]):
     console.print(f"[bold blue]Sending prompt to LLM...[/bold blue]")
@@ -825,38 +884,58 @@ class LocalCoderApp(App):
     @work(thread=True)
     def run_agent_loop_async(self):
         try:
-            for i in range(1, self.max_iterations + 1):
-                self.call_from_thread(self.chat_history.mount, ChatMessage(f"🤖 Agent Thinking (Step {i}/{self.max_iterations}) ...", "system"))
+            def emit_step_start(step: int, max_iters: int):
+                self.call_from_thread(self.chat_history.mount, ChatMessage(f"🤖 Agent Thinking (Step {step}/{max_iters}) ...", "system"))
                 self.call_after_refresh(self.chat_history.scroll_end, animate=False)
 
-                stream_msg = StreamMessage(f"Assistant (Step {i})")
+            def execute_stream(step: int) -> str:
+                stream_msg = StreamMessage(f"Assistant (Step {step})")
                 self.call_from_thread(self.chat_history.mount, stream_msg)
 
                 def on_update(text, _stream_msg=stream_msg):
                     self.call_from_thread(_stream_msg.update_content, text)
                     self.call_from_thread(self.chat_history.scroll_end, animate=False)
 
-                assistant_response = stream_completion(self.client, self.model, self.messages, on_update)
+                return stream_completion(self.client, self.model, self.messages, on_update)
 
-                self.messages.append({"role": "assistant", "content": assistant_response})
+            def emit_stream_interrupted(e: StreamInterrupted):
+                pass # Handled by outer try/except if it bubbled up, but we swallow in core loop. TUI doesn't interrupt yet.
 
-                # Execute tools
-                tool_results = parse_and_execute_tools(self.target_dir, assistant_response)
+            def emit_error(e: Exception):
+                self.call_from_thread(self.chat_history.mount, ChatMessage(f"Error: {e}", "system"))
 
-                if not tool_results:
-                    self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))
-                    self.call_after_refresh(self.chat_history.scroll_end, animate=False)
-                    break
+            def emit_empty_response():
+                self.call_from_thread(self.chat_history.mount, ChatMessage("Received empty response from the model.", "system"))
 
+            def emit_no_tools():
+                self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))
+                self.call_after_refresh(self.chat_history.scroll_end, animate=False)
+
+            def emit_tool_results(tool_results: list[dict]):
                 for tr in tool_results:
-                    # Show tool result in UI
                     self.call_from_thread(self.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr['path']}:\n{tr['result']}", "system"))
 
-                result_message = build_tool_result_message(tool_results)
-                self.messages.append({"role": "user", "content": result_message, "is_tool_result": True})
-                compact_old_tool_results(self.messages)
+            def emit_sending_results():
+                pass # No specific sending message in TUI mode
+
+            def post_step_action():
                 self.call_after_refresh(self.chat_history.scroll_end, animate=False)
                 self.call_from_thread(self._trim_chat_history)
+
+            core_agent_loop(
+                target_dir=self.target_dir,
+                messages=self.messages,
+                max_iterations=self.max_iterations,
+                emit_step_start=emit_step_start,
+                execute_stream=execute_stream,
+                emit_stream_interrupted=emit_stream_interrupted,
+                emit_error=emit_error,
+                emit_empty_response=emit_empty_response,
+                emit_no_tools=emit_no_tools,
+                emit_tool_results=emit_tool_results,
+                emit_sending_results=emit_sending_results,
+                post_step_action=post_step_action
+            )
 
         except Exception as e:
             self.call_from_thread(self.chat_history.mount, ChatMessage(f"Error: {e}", "system"))
