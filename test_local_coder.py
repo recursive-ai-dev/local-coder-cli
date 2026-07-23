@@ -254,6 +254,31 @@ class TestLocalCoder(unittest.TestCase):
         self.assertTrue(m_dir.exists())
         self.assertTrue(m_dir.is_dir())
 
+    def test_console_repl_slash_commands(self):
+        import io
+        import sys as _sys
+
+        original_stdout = _sys.stdout
+        _sys.stdout = captured_output = io.StringIO()
+
+        original_input = local_coder.console.input
+        inputs = iter(["/tools", "/agents", "/help", "/unknown", "/exit"])
+        local_coder.console.input = lambda *a, **k: next(inputs)
+
+        try:
+            local_coder.run_console_repl(None, "test-model", self.test_dir, [{"role": "system", "content": "sys prompt"}], False, 10)
+        except StopIteration:
+            pass
+        finally:
+            _sys.stdout = original_stdout
+            local_coder.console.input = original_input
+
+        output = captured_output.getvalue()
+        self.assertIn("Available Tool Tags", output)
+        self.assertIn("Available Agent Profiles", output)
+        self.assertIn("Available Commands", output)
+        self.assertIn("Command /unknown not supported", output)
+
     def test_get_all_agents_merges_builtin_and_custom(self):
         agents_dir = self.test_dir / ".local-coder" / "agents"
         agents_dir.mkdir(parents=True)

@@ -497,6 +497,27 @@ def tool_move_file(target_dir: Path, src: str, dst: str) -> str:
     except Exception as e:
         return f"Error moving file: {str(e)}"
 
+def _tools_info_markdown() -> str:
+    return (
+        "**Available Tool Tags:**\n"
+        "- `<list_dir path=\"...\">`: List files in a directory (add `show_ignored=\"true\"` to bypass .gitignore filtering)\n"
+        "- `<read_file>path</read_file>`: Read file content\n"
+        "- `<search_files path=\"...\">pattern</search_files>`: Regex search across a file or directory\n"
+        "- `<write_file path=\"...\">content</write_file>`: Create/overwrite a file (asks for confirmation)\n"
+        "- `<patch_file path=\"...\"><search>...</search><replace>...</replace></patch_file>`: Edit a file (asks for confirmation)\n"
+        "- `<delete_file>path</delete_file>`: Delete a file\n"
+        "- `<move_file src=\"...\" dst=\"...\" />`: Move/rename a file\n"
+        "- `<spawn_agent name=\"...\">task</spawn_agent>`: Spawn a configured subagent for a task"
+    )
+
+def _agents_info_markdown(target_dir: Path) -> str:
+    agents = get_all_agents(target_dir)
+    lines = ["**Available Agent Profiles:**"]
+    for key, data in agents.items():
+        kind = "Built-in" if key in BUILTIN_AGENTS else "Custom"
+        lines.append(f"- `{key}` ({kind}): {data.get('description', '')}")
+    return "\n".join(lines)
+
 def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
     if TUI_MODE: return
     """Print the tool execution beautifully in the console."""
@@ -938,6 +959,54 @@ def run_single_prompt(client: OpenAI, model: str, messages: list[dict]):
         console.print(f"[bold red]API call failed:[/bold red] {e}")
     return messages
 
+def run_console_repl(client: OpenAI, model: str, target_dir: Path, messages: list[dict], agent_mode: bool, max_iterations: int):
+    console.print(Panel(f"[bold green]Target Directory:[/bold green] {target_dir.resolve()}\n[bold green]Model:[/bold green] {model}\n[bold green]Agent Mode:[/bold green] {agent_mode}", title="Console REPL Started"))
+    console.print("Type your instruction below. Use [bold]/help[/bold] for available commands.")
+
+    while True:
+        try:
+            user_input = console.input("\n[bold cyan]You:[/bold cyan] ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[bold yellow]Exiting...[/bold yellow]")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.startswith("/"):
+            cmd = user_input.lower().split()[0]
+            if cmd in ["/exit", "/quit"]:
+                console.print("[bold yellow]Exiting...[/bold yellow]")
+                break
+            elif cmd == "/clear":
+                sys_prompt = messages[0]
+                messages.clear()
+                messages.append(sys_prompt)
+                console.print("[bold green]History cleared. System prompt retained.[/bold green]")
+            elif cmd == "/tools":
+                console.print(Panel(Markdown(_tools_info_markdown()), title="Tools", border_style="blue"))
+            elif cmd == "/agents":
+                console.print(Panel(Markdown(_agents_info_markdown(target_dir)), title="Agents", border_style="blue"))
+            elif cmd == "/help":
+                help_text = (
+                    "**Available Commands:**\n"
+                    "- `/help`: Show this help message\n"
+                    "- `/clear`: Clear message history (retains system prompt)\n"
+                    "- `/tools`: List available tool tags\n"
+                    "- `/agents`: List configured agent profiles\n"
+                    "- `/exit` or `/quit`: Exit the REPL"
+                )
+                console.print(Panel(Markdown(help_text), title="Help", border_style="blue"))
+            else:
+                console.print(f"[bold red]Command {cmd} not supported in Console REPL. Supported: /help, /clear, /tools, /agents, /exit[/bold red]")
+            continue
+
+        messages.append({"role": "user", "content": user_input})
+        if agent_mode:
+            run_agent_loop(client, model, target_dir, messages, max_iterations)
+        else:
+            run_single_prompt(client, model, messages)
+
 def _probe_provider(url: str) -> bool:
     try:
         with httpx.Client(timeout=1.0) as http_client:
@@ -1364,6 +1433,12 @@ class LocalCoderApp(App):
             self.push_screen(DownloadModelScreen())
         elif cmd == "/serve":
             self.push_screen(ServeModelScreen())
+        elif cmd == "/tools":
+            await self.chat_history.mount(ChatMessage(_tools_info_markdown(), "system"))
+            self.chat_history.scroll_end(animate=False)
+        elif cmd == "/agents":
+            await self.chat_history.mount(ChatMessage(_agents_info_markdown(self.target_dir), "system"))
+            self.chat_history.scroll_end(animate=False)
         elif cmd == "/help":
             help_text = (
                 "**Available Commands:**\n"
@@ -1371,13 +1446,15 @@ class LocalCoderApp(App):
                 "- `/models`: Manage (list & download) local GGUF models\n"
                 "- `/serve`: Serve a downloaded model using llama-server\n"
                 "- `/dir`: List files in the target directory\n"
+                "- `/tools`: List available tool tags\n"
+                "- `/agents`: List configured agent profiles\n"
                 "- `/clear`: Clear history or screen\n"
                 "- `/exit` or `/quit`: Exit the interactive session"
             )
             await self.chat_history.mount(ChatMessage(help_text, "system"))
             self.chat_history.scroll_end(animate=False)
         else:
-            await self.chat_history.mount(ChatMessage(f"Command {cmd} not supported in TUI yet. Supported: /exit, /clear, /dir, /models, /serve, /help", "system"))
+            await self.chat_history.mount(ChatMessage(f"Command {cmd} not supported in TUI yet. Supported: /exit, /clear, /dir, /models, /serve, /tools, /agents, /help", "system"))
             self.chat_history.scroll_end(animate=False)
 
     @work(thread=True)
@@ -1459,7 +1536,8 @@ def main():
     parser.add_argument("--system-prompt", help="Path to custom system prompt txt file")
     parser.add_argument("--agent", action="store_true", help="Enable autonomous agent loop with filesystem tools")
     parser.add_argument("--max-iterations", type=int, default=10, help="Maximum number of loop iterations for agent mode")
-    parser.add_argument("-i", "--interactive", action="store_true", help="Force launch the interactive REPL shell")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Force launch the interactive REPL shell (TUI)")
+    parser.add_argument("--console", action="store_true", help="Force launch the interactive REPL in plain console mode instead of the TUI")
     parser.add_argument("--yolo", action="store_true", help="Auto-approve destructive operations (no prompts)")
     parser.add_argument("--auto-approve", action="store_true", help="Alias for --yolo")
     parser.add_argument("--show-ignored", action="store_true", help="Do not filter out .git and .gitignore-matched files in directory listings")
@@ -1544,15 +1622,18 @@ def main():
     else:
         _SESSION_FILE = target_dir / ".local-coder" / "sessions" / f"{int(time.time())}.json"
 
-    is_interactive = args.interactive or (not args.prompt)
+    is_interactive = args.interactive or args.console or (not args.prompt)
 
 
     if is_interactive:
-        global TUI_MODE, _APP_INSTANCE
-        TUI_MODE = True
-        app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations)
-        _APP_INSTANCE = app
-        app.run()
+        if args.console:
+            run_console_repl(client, model, target_dir, messages, args.agent, args.max_iterations)
+        else:
+            global TUI_MODE, _APP_INSTANCE
+            TUI_MODE = True
+            app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations)
+            _APP_INSTANCE = app
+            app.run()
     else:
         messages.append({"role": "user", "content": args.prompt})
         console.print(Panel(f"[bold green]Target Directory:[/bold green] {target_dir.resolve()}\n[bold green]Provider:[/bold green] {provider} ({api_url})\n[bold green]Task:[/bold green] {args.prompt}", title="Agent Run Started"))
