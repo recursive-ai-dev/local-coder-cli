@@ -110,6 +110,9 @@ class TestLocalCoder(unittest.TestCase):
 
     def test_parse_and_execute_tools(self):
         import textwrap
+        # Set YOLO mode to true for original test behavior
+        local_coder._YOLO_MODE = True
+
         # We simulate the LLM's response containing multiple tool blocks
         llm_response = textwrap.dedent("""\
             I will create a script and verify it.
@@ -130,6 +133,57 @@ class TestLocalCoder(unittest.TestCase):
         self.assertEqual(results[1]["tool"], "read_file")
         self.assertEqual(results[1]["path"], "script.py")
         self.assertEqual(results[1]["result"], 'print("Hello CLI")\n')
+        local_coder._YOLO_MODE = False
+
+    def test_ask_user_confirmation_console_deny(self):
+        import textwrap
+        from unittest.mock import patch
+
+        local_coder._YOLO_MODE = False
+        local_coder.TUI_MODE = False
+
+        llm_response = textwrap.dedent("""\
+            <write_file path="evil.py" lang="python">
+            print("pwned")
+            </write_file>
+        """)
+
+        with patch("local_coder.Confirm.ask", return_value=False):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "write_file")
+        self.assertEqual(results[0]["path"], "evil.py")
+        self.assertEqual(results[0]["result"], "Error: User denied permission to write file.")
+
+        # Verify file was NOT created
+        file_path = self.test_dir / "evil.py"
+        self.assertFalse(file_path.exists())
+
+    def test_ask_user_confirmation_console_allow(self):
+        import textwrap
+        from unittest.mock import patch
+
+        local_coder._YOLO_MODE = False
+        local_coder.TUI_MODE = False
+
+        llm_response = textwrap.dedent("""\
+            <write_file path="good.py" lang="python">
+            print("good")
+            </write_file>
+        """)
+
+        with patch("local_coder.Confirm.ask", return_value=True):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "write_file")
+        self.assertEqual(results[0]["path"], "good.py")
+        self.assertIn("Successfully wrote", results[0]["result"])
+
+        # Verify file WAS created
+        file_path = self.test_dir / "good.py"
+        self.assertTrue(file_path.exists())
 
     def test_provider_detection_fallback(self):
         # When no endpoints are active, detect_provider returns (None, None)
