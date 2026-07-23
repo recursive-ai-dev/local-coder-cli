@@ -54,6 +54,30 @@ class TestLocalCoder(unittest.TestCase):
         list_sub_res = local_coder.tool_list_dir(self.test_dir, "sub")
         self.assertIn("[FILE] sub/b.txt", list_sub_res)
 
+    def test_tool_list_dir_ignore(self):
+        # Create .gitignore, .git, and some matching files
+        local_coder.tool_write_file(self.test_dir, ".gitignore", "ignored_dir/\n*.pyc\n")
+        (self.test_dir / ".git").mkdir()
+        (self.test_dir / "ignored_dir").mkdir()
+        local_coder.tool_write_file(self.test_dir, "ignored_dir/hidden.txt", "content")
+        local_coder.tool_write_file(self.test_dir, "test.pyc", "binary")
+        local_coder.tool_write_file(self.test_dir, "visible.txt", "content")
+
+        # By default, should NOT show .git, .gitignore files based on patterns
+        list_res = local_coder.tool_list_dir(self.test_dir, ".")
+        self.assertIn("[FILE] visible.txt", list_res)
+        self.assertIn("[FILE] .gitignore", list_res) # .gitignore itself is not ignored unless explicitly ignored
+        self.assertNotIn("[DIR]  .git", list_res)
+        self.assertNotIn("[DIR]  ignored_dir", list_res)
+        self.assertNotIn("[FILE] test.pyc", list_res)
+
+        # If show_ignored=True, everything is shown
+        list_res_ignored = local_coder.tool_list_dir(self.test_dir, ".", show_ignored=True)
+        self.assertIn("[FILE] visible.txt", list_res_ignored)
+        self.assertIn("[DIR]  .git", list_res_ignored)
+        self.assertIn("[DIR]  ignored_dir", list_res_ignored)
+        self.assertIn("[FILE] test.pyc", list_res_ignored)
+
     def test_tool_patch_file(self):
         content = "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b"
         local_coder.tool_write_file(self.test_dir, "math_utils.py", content)

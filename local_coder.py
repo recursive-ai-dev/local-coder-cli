@@ -77,6 +77,51 @@ def get_models_dir() -> Path:
     m_dir.mkdir(parents=True, exist_ok=True)
     return m_dir
 
+import fnmatch
+
+def _load_gitignore(target_dir: Path) -> list[str]:
+    gitignore_path = target_dir / ".gitignore"
+    patterns = [".git/"]
+    if gitignore_path.exists() and gitignore_path.is_file():
+        try:
+            for line in gitignore_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    patterns.append(line)
+        except Exception:
+            pass
+    return patterns
+
+def _is_ignored(rel_path: Path, patterns: list[str], is_dir: bool) -> bool:
+    path_str = rel_path.as_posix()
+    parts = path_str.split('/')
+    if ".git" in parts:
+        return True
+
+    for pattern in patterns:
+        dir_only = pattern.endswith('/')
+        pat = pattern.rstrip('/')
+
+        if not pat:
+            continue
+
+        if '/' not in pat:
+            for i, part in enumerate(parts):
+                if fnmatch.fnmatch(part, pat):
+                    if dir_only:
+                        if i == len(parts) - 1 and not is_dir:
+                            continue
+                    return True
+        else:
+            pat_match = pat.lstrip('/')
+            if fnmatch.fnmatch(path_str, pat_match) or fnmatch.fnmatch(path_str, pat_match + '/*'):
+                if dir_only and not is_dir and fnmatch.fnmatch(path_str, pat_match):
+                    continue
+                return True
+
+    return False
+
+
 def get_safe_path(target_dir: Path, subpath_str: str) -> Path:
     """Resolve subpath safely, ensuring it is within the target directory."""
     target_dir = target_dir.resolve()
@@ -89,7 +134,7 @@ def get_safe_path(target_dir: Path, subpath_str: str) -> Path:
         raise ValueError(f"Security error: Path '{subpath_str}' escapes target directory '{target_dir}'")
     return resolved
 
-def tool_list_dir(target_dir: Path, path: str) -> str:
+def tool_list_dir(target_dir: Path, path: str, show_ignored: bool = False) -> str:
     try:
         target_dir = target_dir.resolve()
         safe_path = get_safe_path(target_dir, path)
@@ -98,9 +143,17 @@ def tool_list_dir(target_dir: Path, path: str) -> str:
         if not safe_path.is_dir():
             return f"Error: Path '{path}' is a file, not a directory."
         
+        ignore_patterns = []
+        if not show_ignored:
+            ignore_patterns = _load_gitignore(target_dir)
+
         entries = []
         for entry in safe_path.iterdir():
             rel_path = entry.relative_to(target_dir)
+
+            if not show_ignored and _is_ignored(rel_path, ignore_patterns, entry.is_dir()):
+                continue
+
             prefix = "[DIR] " if entry.is_dir() else "[FILE]"
             entries.append(f"{prefix} {rel_path}")
         
@@ -234,11 +287,11 @@ def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
     else:
         console.print(Panel(result, border_style="cyan", title="Tool Result"))
 
-def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
+def parse_and_execute_tools(target_dir: Path, text: str, show_ignored_default: bool = False) -> list[dict]:
     """Parse XML tags in response and execute tools in the order they appear."""
     matches = []
     
-    for m in re.finditer(r"<list_dir>(.*?)</list_dir\s*>", text, re.DOTALL):
+    for m in re.finditer(r"<list_dir(?:[^>]*show_ignored=[\"'](true|false)[\"'])?[^>]*>(.*?)</list_dir\s*>", text, re.DOTALL):
         matches.append((m.start(), "list_dir", m))
         
     for m in re.finditer(r"<read_file>(.*?)</read_file\s*>", text, re.DOTALL):
@@ -255,8 +308,14 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
     results = []
     for _, tag_type, m in matches:
         if tag_type == "list_dir":
-            path = m.group(1).strip()
-            res = tool_list_dir(target_dir, path)
+            show_ignored_attr = m.group(1)
+            path = m.group(2).strip()
+
+            show_ignored = show_ignored_default
+            if show_ignored_attr:
+                show_ignored = show_ignored_attr.lower() == "true"
+
+            res = tool_list_dir(target_dir, path, show_ignored=show_ignored)
             format_and_print_tool_call("list_dir", path, res)
             results.append({"tool": "list_dir", "path": path, "result": res})
             
@@ -356,7 +415,7 @@ def build_tool_result_message(tool_results: list[dict]) -> str:
     ]
     return "\n".join(parts)
 
-def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int):
+def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int, show_ignored: bool = False):
     """Executes the agentic reasoning & execution loop with live updates."""
     for i in range(1, max_iterations + 1):
         console.print(f"\n[bold blue]🤖 Agent Thinking (Step {i}/{max_iterations}) ...[/bold blue]")
@@ -382,7 +441,7 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
 
         messages.append({"role": "assistant", "content": assistant_response})
 
-        tool_results = parse_and_execute_tools(target_dir, assistant_response)
+        tool_results = parse_and_execute_tools(target_dir, assistant_response, show_ignored_default=show_ignored)
 
         if not tool_results:
             console.print("[bold green]✔ No tools triggered or task complete.[/bold green]")
@@ -708,7 +767,7 @@ class LocalCoderApp(App):
     }
     """
     
-    def __init__(self, client, model, target_dir, messages, agent_mode, max_iterations):
+    def __init__(self, client, model, target_dir, messages, agent_mode, max_iterations, show_ignored: bool = False):
         super().__init__()
         self.client = client
         self.model = model
@@ -716,6 +775,7 @@ class LocalCoderApp(App):
         self.messages = messages
         self.agent_mode = agent_mode
         self.max_iterations = max_iterations
+        self.show_ignored = show_ignored
         self.is_processing = False
 
     def compose(self) -> ComposeResult:
@@ -770,7 +830,7 @@ class LocalCoderApp(App):
         if cmd in ["/exit", "/quit"]:
             self.exit()
         elif cmd == "/dir":
-            res = tool_list_dir(self.target_dir, ".")
+            res = tool_list_dir(self.target_dir, ".", show_ignored=self.show_ignored)
             await self.chat_history.mount(ChatMessage(res, "system"))
             self.chat_history.scroll_end(animate=False)
         elif cmd == "/clear":
@@ -841,7 +901,7 @@ class LocalCoderApp(App):
                 self.messages.append({"role": "assistant", "content": assistant_response})
 
                 # Execute tools
-                tool_results = parse_and_execute_tools(self.target_dir, assistant_response)
+                tool_results = parse_and_execute_tools(self.target_dir, assistant_response, show_ignored_default=self.show_ignored)
 
                 if not tool_results:
                     self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))
@@ -875,6 +935,7 @@ def main():
     parser.add_argument("--agent", action="store_true", help="Enable autonomous agent loop with filesystem tools")
     parser.add_argument("--max-iterations", type=int, default=10, help="Maximum number of loop iterations for agent mode")
     parser.add_argument("-i", "--interactive", action="store_true", help="Force launch the interactive REPL shell")
+    parser.add_argument("--show-ignored", action="store_true", help="Do not filter out .git and .gitignore files in directory listings")
     parser.add_argument("prompt", nargs="?", help="The programming task / instruction for the LLM")
     
     args = parser.parse_args()
@@ -917,13 +978,13 @@ def main():
     if is_interactive:
         global TUI_MODE
         TUI_MODE = True
-        app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations)
+        app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations, show_ignored=args.show_ignored)
         app.run()
     else:
         messages.append({"role": "user", "content": args.prompt})
         console.print(Panel(f"[bold green]Target Directory:[/bold green] {target_dir.resolve()}\n[bold green]Provider:[/bold green] {provider} ({api_url})\n[bold green]Task:[/bold green] {args.prompt}", title="Agent Run Started"))
         if args.agent:
-            run_agent_loop(client, model, target_dir, messages, args.max_iterations)
+            run_agent_loop(client, model, target_dir, messages, args.max_iterations, show_ignored=args.show_ignored)
         else:
             run_single_prompt(client, model, messages)
 
