@@ -108,6 +108,9 @@ def get_safe_path(target_dir: Path, subpath_str: str) -> Path:
     """Resolve subpath safely, ensuring it is within the target directory."""
     target_dir = target_dir.resolve()
     subpath_str = subpath_str.strip()
+    # Normalize Windows backslashes to forward slashes so a "..\\..\\etc\\passwd"
+    # style sequence can't dodge the POSIX absolute/traversal checks below.
+    subpath_str = subpath_str.replace("\\", "/")
     if subpath_str.startswith("/") or Path(subpath_str).is_absolute():
         raise ValueError(f"Security error: Absolute path '{subpath_str}' is not allowed.")
     
@@ -353,9 +356,16 @@ def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str
         matches.append((m.start(), "move_file", m))
 
     matches.sort(key=lambda x: x[0])
-    
+
+    # Reject any match whose start falls inside an already-consumed span, so a
+    # tag literally appearing in another tag's body (e.g. a <read_file> inside
+    # a write_file's own content) is treated as literal text, not re-executed.
     results = []
-    for _, tag_type, m in matches:
+    last_end = 0
+    for start, tag_type, m in matches:
+        if start < last_end:
+            continue
+        last_end = m.end()
         if allowed_tools is not None and tag_type not in allowed_tools:
             res = f"Error: Tool '{tag_type}' is not permitted by this agent's configuration."
             format_and_print_tool_call(tag_type, "N/A", res)

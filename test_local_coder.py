@@ -252,6 +252,57 @@ class TestLocalCoder(unittest.TestCase):
         self.assertTrue(m_dir.exists())
         self.assertTrue(m_dir.is_dir())
 
+    def test_windows_style_path_traversal(self):
+        with self.assertRaises(ValueError):
+            local_coder.get_safe_path(self.test_dir, "..\\..\\etc\\passwd")
+
+    def test_multiple_tool_calls_ordering(self):
+        import textwrap
+        llm_response = textwrap.dedent("""\
+            <read_file>1.txt</read_file>
+            <list_dir>.</list_dir>
+            <delete_file>2.txt</delete_file>
+        """)
+        results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+        self.assertEqual(len(results), 3)
+        self.assertEqual(results[0]["tool"], "read_file")
+        self.assertEqual(results[1]["tool"], "list_dir")
+        self.assertEqual(results[2]["tool"], "delete_file")
+
+    def test_malformed_tags_ignored(self):
+        llm_response = """
+            Here is a malformed tag:
+            <write_file path="test.txt">
+            Content without closing tag
+
+            And an unclosed read:
+            <read_file>missing_close.txt
+        """
+        results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+        self.assertEqual(len(results), 0)
+
+    def test_nested_tags_ignored(self):
+        # Tags inside the body of a write_file should be treated as literal
+        # content, not re-parsed as their own tool calls.
+        local_coder._YOLO_MODE = True
+        try:
+            llm_response = """
+                <write_file path="nested.xml">
+                <read_file>some_file.txt</read_file>
+                <list_dir>.</list_dir>
+                </write_file>
+            """
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["tool"], "write_file")
+            self.assertEqual(results[0]["path"], "nested.xml")
+
+            content = (self.test_dir / "nested.xml").read_text()
+            self.assertIn("<read_file>some_file.txt</read_file>", content)
+            self.assertIn("<list_dir>.</list_dir>", content)
+        finally:
+            local_coder._YOLO_MODE = False
+
 if __name__ == "__main__":
     unittest.main()
 
