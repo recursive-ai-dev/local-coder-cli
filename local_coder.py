@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import json
 import time
 import sys
 import re
@@ -68,6 +69,52 @@ MODELS_PRESETS = {
         }
     }
 }
+
+
+def save_session(session_file: Path, messages: list[dict]):
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    filtered = [m for m in messages if m.get("role") != "system"]
+    with open(session_file, "w", encoding="utf-8") as f:
+        json.dump(filtered, f, indent=2)
+
+def load_session(session_file: Path) -> list[dict]:
+    try:
+        with open(session_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def resolve_session_file(target_dir: Path, session_arg: str | None) -> Path | None:
+    if not session_arg:
+        return None
+
+    sessions_dir = target_dir / ".local-coder" / "sessions"
+    if not sessions_dir.exists():
+        return None
+
+    if session_arg == "LATEST":
+        files = list(sessions_dir.glob("*.json"))
+        if not files:
+            return None
+        return max(files, key=lambda p: p.stat().st_mtime)
+
+    # specific file
+    try:
+        specific = get_safe_path(sessions_dir, session_arg)
+        if specific.exists():
+            return specific
+    except ValueError:
+        pass
+
+    # try as full path relative to target_dir
+    try:
+        full = get_safe_path(target_dir, session_arg)
+        if full.exists():
+            return full
+    except ValueError:
+        pass
+
+    return None
 
 def get_models_dir() -> Path:
     if getattr(sys, 'frozen', False):
@@ -356,7 +403,7 @@ def build_tool_result_message(tool_results: list[dict]) -> str:
     ]
     return "\n".join(parts)
 
-def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int):
+def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int, session_file: Path):
     """Executes the agentic reasoning & execution loop with live updates."""
     for i in range(1, max_iterations + 1):
         console.print(f"\n[bold blue]🤖 Agent Thinking (Step {i}/{max_iterations}) ...[/bold blue]")
@@ -381,6 +428,7 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
             break
 
         messages.append({"role": "assistant", "content": assistant_response})
+        save_session(session_file, messages)
 
         tool_results = parse_and_execute_tools(target_dir, assistant_response)
 
@@ -392,10 +440,11 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
         console.print(f"[bold cyan]Sending tool results back to LLM...[/bold cyan]")
         messages.append({"role": "user", "content": result_message, "is_tool_result": True})
         compact_old_tool_results(messages)
+        save_session(session_file, messages)
 
     return messages
 
-def run_single_prompt(client: OpenAI, model: str, messages: list[dict]):
+def run_single_prompt(client: OpenAI, model: str, messages: list[dict], session_file: Path):
     console.print(f"[bold blue]Sending prompt to LLM...[/bold blue]")
     try:
         with Live(console=console, refresh_per_second=8) as live:
@@ -403,6 +452,7 @@ def run_single_prompt(client: OpenAI, model: str, messages: list[dict]):
                 live.update(Panel(Markdown(text), title="Assistant Response", border_style="blue"))
             assistant_response = stream_completion(client, model, messages, on_update)
         messages.append({"role": "assistant", "content": assistant_response})
+        save_session(session_file, messages)
     except StreamInterrupted as e:
         console.print("\n[bold yellow]Generation interrupted by user.[/bold yellow]")
         if e.partial_text:
@@ -708,7 +758,7 @@ class LocalCoderApp(App):
     }
     """
     
-    def __init__(self, client, model, target_dir, messages, agent_mode, max_iterations):
+    def __init__(self, client, model, target_dir, messages, agent_mode, max_iterations, session_file):
         super().__init__()
         self.client = client
         self.model = model
@@ -717,6 +767,7 @@ class LocalCoderApp(App):
         self.agent_mode = agent_mode
         self.max_iterations = max_iterations
         self.is_processing = False
+        self.session_file = session_file
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -755,6 +806,7 @@ class LocalCoderApp(App):
             return
 
         self.messages.append({"role": "user", "content": user_input})
+        save_session(self.session_file, self.messages)
         await self.chat_history.mount(ChatMessage(user_input, "user"))
         self.call_after_refresh(self.chat_history.scroll_end, animate=False)
         self._trim_chat_history()
@@ -816,6 +868,7 @@ class LocalCoderApp(App):
             assistant_response = stream_completion(self.client, self.model, self.messages, on_update)
             self.call_from_thread(self._trim_chat_history)
             self.messages.append({"role": "assistant", "content": assistant_response})
+            save_session(self.session_file, self.messages)
 
         except Exception as e:
             self.call_from_thread(self.chat_history.mount, ChatMessage(f"Error: {e}", "system"))
@@ -839,6 +892,7 @@ class LocalCoderApp(App):
                 assistant_response = stream_completion(self.client, self.model, self.messages, on_update)
 
                 self.messages.append({"role": "assistant", "content": assistant_response})
+                save_session(self.session_file, self.messages)
 
                 # Execute tools
                 tool_results = parse_and_execute_tools(self.target_dir, assistant_response)
@@ -855,6 +909,7 @@ class LocalCoderApp(App):
                 result_message = build_tool_result_message(tool_results)
                 self.messages.append({"role": "user", "content": result_message, "is_tool_result": True})
                 compact_old_tool_results(self.messages)
+                save_session(self.session_file, self.messages)
                 self.call_after_refresh(self.chat_history.scroll_end, animate=False)
                 self.call_from_thread(self._trim_chat_history)
 
@@ -872,6 +927,7 @@ def main():
     parser.add_argument("--model", help="Model identifier to specify in the API calls")
     parser.add_argument("--target-dir", default=".", help="Target folder for file operations (default: current directory)")
     parser.add_argument("--system-prompt", help="Path to custom system prompt txt file")
+    parser.add_argument("--resume", nargs="?", const="LATEST", help="Resume a previous session (provide filename or leave blank for most recent)")
     parser.add_argument("--agent", action="store_true", help="Enable autonomous agent loop with filesystem tools")
     parser.add_argument("--max-iterations", type=int, default=10, help="Maximum number of loop iterations for agent mode")
     parser.add_argument("-i", "--interactive", action="store_true", help="Force launch the interactive REPL shell")
@@ -911,21 +967,35 @@ def main():
     
     messages = [{"role": "system", "content": system_prompt_content}]
     
-    is_interactive = args.interactive or (not args.prompt)
+    session_file = None
+    if getattr(args, "resume", None):
+        session_file = resolve_session_file(target_dir, args.resume)
+        if session_file:
+            console.print(f"[bold green]Resuming session from {session_file}[/bold green]")
+            loaded_messages = load_session(session_file)
+            messages.extend(loaded_messages)
+        else:
+            console.print(f"[bold yellow]Warning: Could not find session to resume for '{args.resume}'. Starting new session.[/bold yellow]")
+            session_file = target_dir / ".local-coder" / "sessions" / f"{int(time.time())}.json"
+    else:
+        session_file = target_dir / ".local-coder" / "sessions" / f"{int(time.time())}.json"
+
+    is_interactive = args.interactive or (not getattr(args, "prompt", None))
     
 
     if is_interactive:
         global TUI_MODE
         TUI_MODE = True
-        app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations)
+        app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations, session_file)
         app.run()
     else:
-        messages.append({"role": "user", "content": args.prompt})
+        if not getattr(args, "resume", None) or (getattr(args, "resume", None) and getattr(args, "prompt", None)):
+            messages.append({"role": "user", "content": args.prompt})
         console.print(Panel(f"[bold green]Target Directory:[/bold green] {target_dir.resolve()}\n[bold green]Provider:[/bold green] {provider} ({api_url})\n[bold green]Task:[/bold green] {args.prompt}", title="Agent Run Started"))
         if args.agent:
-            run_agent_loop(client, model, target_dir, messages, args.max_iterations)
+            run_agent_loop(client, model, target_dir, messages, args.max_iterations, session_file)
         else:
-            run_single_prompt(client, model, messages)
+            run_single_prompt(client, model, messages, session_file)
 
 if __name__ == "__main__":
     main()

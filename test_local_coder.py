@@ -114,7 +114,60 @@ class TestLocalCoder(unittest.TestCase):
         self.assertTrue(m_dir.exists())
         self.assertTrue(m_dir.is_dir())
 
+
+    def test_save_load_session(self):
+        session_file = self.test_dir / ".local-coder" / "sessions" / "test_session.json"
+
+        messages = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "World"},
+        ]
+
+        local_coder.save_session(session_file, messages)
+        self.assertTrue(session_file.exists())
+
+        loaded = local_coder.load_session(session_file)
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(loaded[0]["role"], "user")
+        self.assertEqual(loaded[1]["role"], "assistant")
+        self.assertEqual(loaded[1]["content"], "World")
+
+    def test_resolve_session_file(self):
+        sessions_dir = self.test_dir / ".local-coder" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        file1 = sessions_dir / "1.json"
+        file1.write_text("[]")
+
+        import time
+        time.sleep(0.01)
+
+        file2 = sessions_dir / "2.json"
+        file2.write_text("[]")
+
+        # Test LATEST
+        resolved = local_coder.resolve_session_file(self.test_dir, "LATEST")
+        self.assertEqual(resolved, file2)
+
+        # Test specific filename in directory
+        resolved = local_coder.resolve_session_file(self.test_dir, "1.json")
+        self.assertEqual(resolved, file1)
+
+        # Test full path (using relative path from target_dir to be safe)
+        resolved = local_coder.resolve_session_file(self.test_dir, ".local-coder/sessions/1.json")
+        self.assertEqual(resolved, file1)
+
+        # Test out of bounds
+        resolved = local_coder.resolve_session_file(self.test_dir, "/absolute/path/file.json")
+        self.assertIsNone(resolved)
+
+        resolved = local_coder.resolve_session_file(self.test_dir, "../out_of_bounds.json")
+        self.assertIsNone(resolved)
+
+        # Test None
+        resolved = local_coder.resolve_session_file(self.test_dir, None)
+        self.assertIsNone(resolved)
+
 if __name__ == "__main__":
     unittest.main()
-
-
