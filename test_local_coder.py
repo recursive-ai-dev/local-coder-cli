@@ -1,6 +1,7 @@
 import unittest
 import tempfile
 import shutil
+import time
 from pathlib import Path
 import local_coder
 
@@ -251,6 +252,50 @@ class TestLocalCoder(unittest.TestCase):
         m_dir = local_coder.get_models_dir()
         self.assertTrue(m_dir.exists())
         self.assertTrue(m_dir.is_dir())
+
+    def test_save_load_session(self):
+        session_file = self.test_dir / ".local-coder" / "sessions" / "test_session.json"
+        messages = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "World"},
+        ]
+        local_coder.save_session(session_file, messages)
+        self.assertTrue(session_file.exists())
+
+        loaded = local_coder.load_session(session_file)
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(loaded[0]["role"], "user")
+        self.assertEqual(loaded[1]["role"], "assistant")
+        self.assertEqual(loaded[1]["content"], "World")
+
+    def test_resolve_session_file(self):
+        sessions_dir = self.test_dir / ".local-coder" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        file1 = sessions_dir / "1.json"
+        file1.write_text("[]")
+        time.sleep(0.01)
+        file2 = sessions_dir / "2.json"
+        file2.write_text("[]")
+
+        resolved = local_coder.resolve_session_file(self.test_dir, "LATEST")
+        self.assertEqual(resolved, file2)
+
+        resolved = local_coder.resolve_session_file(self.test_dir, "1.json")
+        self.assertEqual(resolved, file1)
+
+        resolved = local_coder.resolve_session_file(self.test_dir, ".local-coder/sessions/1.json")
+        self.assertEqual(resolved, file1)
+
+        resolved = local_coder.resolve_session_file(self.test_dir, "/absolute/path/file.json")
+        self.assertIsNone(resolved)
+
+        resolved = local_coder.resolve_session_file(self.test_dir, "../out_of_bounds.json")
+        self.assertIsNone(resolved)
+
+        resolved = local_coder.resolve_session_file(self.test_dir, None)
+        self.assertIsNone(resolved)
 
     def test_trim_messages_context(self):
         messages = [{"role": "system", "content": "You are a helpful bot."}]

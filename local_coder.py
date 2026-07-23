@@ -35,6 +35,7 @@ TUI_MODE = False
 _YOLO_MODE = False
 _SHOW_IGNORED = False
 _MAX_HISTORY = 20
+_SESSION_FILE = None
 _APP_INSTANCE = None
 
 MODELS_PRESETS = {
@@ -105,6 +106,51 @@ def load_agent_config(target_dir: Path, name: str) -> dict:
         return json.loads(fallback_file.read_text(encoding="utf-8"))
 
     raise FileNotFoundError(f"Agent config '{name}.json' not found in target dir or bundled agents dir.")
+
+def save_session(session_file: Path, messages: list[dict]):
+    if not session_file:
+        return
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    filtered = [m for m in messages if m.get("role") != "system"]
+    with open(session_file, "w", encoding="utf-8") as f:
+        json.dump(filtered, f, indent=2)
+
+def load_session(session_file: Path) -> list[dict]:
+    try:
+        with open(session_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def resolve_session_file(target_dir: Path, session_arg) -> Path | None:
+    if not session_arg:
+        return None
+
+    sessions_dir = target_dir / ".local-coder" / "sessions"
+    if not sessions_dir.exists():
+        return None
+
+    if session_arg == "LATEST":
+        files = list(sessions_dir.glob("*.json"))
+        if not files:
+            return None
+        return max(files, key=lambda p: p.stat().st_mtime)
+
+    try:
+        specific = get_safe_path(sessions_dir, session_arg)
+        if specific.exists():
+            return specific
+    except ValueError:
+        pass
+
+    try:
+        full = get_safe_path(target_dir, session_arg)
+        if full.exists():
+            return full
+    except ValueError:
+        pass
+
+    return None
 
 def get_safe_path(target_dir: Path, subpath_str: str) -> Path:
     """Resolve subpath safely, ensuring it is within the target directory."""
@@ -777,6 +823,7 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
             break
 
         messages.append({"role": "assistant", "content": assistant_response})
+        save_session(_SESSION_FILE, messages)
 
         tool_results = parse_and_execute_tools(target_dir, assistant_response, subagent_runner=subagent_runner_callable)
 
@@ -789,6 +836,7 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
         messages.append({"role": "user", "content": result_message, "is_tool_result": True})
         compact_old_tool_results(messages)
         trim_messages_context(messages, _MAX_HISTORY)
+        save_session(_SESSION_FILE, messages)
 
     return messages
 
@@ -800,6 +848,7 @@ def run_single_prompt(client: OpenAI, model: str, messages: list[dict]):
                 live.update(Panel(Markdown(text), title="Assistant Response", border_style="blue"))
             assistant_response = stream_completion(client, model, messages, on_update)
         messages.append({"role": "assistant", "content": assistant_response})
+        save_session(_SESSION_FILE, messages)
     except StreamInterrupted as e:
         console.print("\n[bold yellow]Generation interrupted by user.[/bold yellow]")
         if e.partial_text:
@@ -1265,6 +1314,7 @@ class LocalCoderApp(App):
             assistant_response = stream_completion(self.client, self.model, self.messages, on_update)
             self.call_from_thread(self._trim_chat_history)
             self.messages.append({"role": "assistant", "content": assistant_response})
+            save_session(_SESSION_FILE, self.messages)
 
         except Exception as e:
             self.call_from_thread(self.chat_history.mount, ChatMessage(f"Error: {e}", "system"))
@@ -1289,6 +1339,7 @@ class LocalCoderApp(App):
                 assistant_response = stream_completion(self.client, self.model, self.messages, on_update)
 
                 self.messages.append({"role": "assistant", "content": assistant_response})
+                save_session(_SESSION_FILE, self.messages)
 
                 # Execute tools
                 tool_results = parse_and_execute_tools(self.target_dir, assistant_response, subagent_runner=subagent_runner_callable)
@@ -1307,6 +1358,7 @@ class LocalCoderApp(App):
                 self.messages.append({"role": "user", "content": result_message, "is_tool_result": True})
                 compact_old_tool_results(self.messages)
                 trim_messages_context(self.messages, _MAX_HISTORY)
+                save_session(_SESSION_FILE, self.messages)
                 self.call_after_refresh(self.chat_history.scroll_end, animate=False)
                 self.call_from_thread(self._trim_chat_history)
 
@@ -1331,6 +1383,7 @@ def main():
     parser.add_argument("--auto-approve", action="store_true", help="Alias for --yolo")
     parser.add_argument("--show-ignored", action="store_true", help="Do not filter out .git and .gitignore-matched files in directory listings")
     parser.add_argument("--max-history", type=int, default=20, help="Maximum number of messages to keep in context (rolling window)")
+    parser.add_argument("--resume", nargs="?", const="LATEST", help="Resume a previous session (provide filename or leave blank for most recent)")
     parser.add_argument("prompt", nargs="?", help="The programming task / instruction for the LLM")
 
     args = parser.parse_args()
@@ -1371,11 +1424,23 @@ def main():
             system_prompt_content = "You are a helpful coding assistant. You have local file system access."
 
     client = OpenAI(base_url=api_url, api_key=api_key)
-    
+
     messages = [{"role": "system", "content": system_prompt_content}]
-    
+
+    global _SESSION_FILE
+    if getattr(args, "resume", None):
+        _SESSION_FILE = resolve_session_file(target_dir, args.resume)
+        if _SESSION_FILE:
+            console.print(f"[bold green]Resuming session from {_SESSION_FILE}[/bold green]")
+            messages.extend(load_session(_SESSION_FILE))
+        else:
+            console.print(f"[bold yellow]Warning: Could not find session to resume for '{args.resume}'. Starting new session.[/bold yellow]")
+            _SESSION_FILE = target_dir / ".local-coder" / "sessions" / f"{int(time.time())}.json"
+    else:
+        _SESSION_FILE = target_dir / ".local-coder" / "sessions" / f"{int(time.time())}.json"
+
     is_interactive = args.interactive or (not args.prompt)
-    
+
 
     if is_interactive:
         global TUI_MODE, _APP_INSTANCE
