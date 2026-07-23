@@ -198,6 +198,36 @@ def tool_patch_file(target_dir: Path, path: str, search: str, replace: str) -> s
     except Exception as e:
         return f"Error patching file: {str(e)}"
 
+def tool_delete_file(target_dir: Path, path: str) -> str:
+    try:
+        target_dir = target_dir.resolve()
+        safe_path = get_safe_path(target_dir, path)
+        if not safe_path.exists():
+            return f"Error: File '{path}' does not exist."
+        if not safe_path.is_file():
+            return f"Error: Path '{path}' is not a file."
+
+        safe_path.unlink()
+        return f"Successfully deleted file '{path}'."
+    except Exception as e:
+        return f"Error deleting file: {str(e)}"
+
+def tool_move_file(target_dir: Path, src: str, dst: str) -> str:
+    try:
+        target_dir = target_dir.resolve()
+        safe_src = get_safe_path(target_dir, src)
+        safe_dst = get_safe_path(target_dir, dst)
+
+        if not safe_src.exists():
+            return f"Error: Source '{src}' does not exist."
+
+        safe_dst.parent.mkdir(parents=True, exist_ok=True)
+        safe_src.rename(safe_dst)
+
+        return f"Successfully moved '{src}' to '{dst}'."
+    except Exception as e:
+        return f"Error moving file: {str(e)}"
+
 def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
     if TUI_MODE: return
     """Print the tool execution beautifully in the console."""
@@ -250,6 +280,12 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
     for m in re.finditer(r"<patch_file\s+path=([\"']?)(.*?)\1[^>]*>\s*<search>(.*?)</search>\s*<replace>(.*?)</replace>\s*</patch_file\s*>", text, re.DOTALL):
         matches.append((m.start(), "patch_file", m))
         
+    for m in re.finditer(r"<delete_file>(.*?)</delete_file\s*>", text, re.DOTALL):
+        matches.append((m.start(), "delete_file", m))
+
+    for m in re.finditer(r"<move_file\s+src=([\"']?)(.*?)\1\s+dst=([\"']?)(.*?)\3\s*/>", text, re.DOTALL):
+        matches.append((m.start(), "move_file", m))
+
     matches.sort(key=lambda x: x[0])
     
     results = []
@@ -287,6 +323,19 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
             format_and_print_tool_call("patch_file", path, res)
             results.append({"tool": "patch_file", "path": path, "result": res})
             
+        elif tag_type == "delete_file":
+            path = m.group(1).strip()
+            res = tool_delete_file(target_dir, path)
+            format_and_print_tool_call("delete_file", path, res)
+            results.append({"tool": "delete_file", "path": path, "result": res})
+
+        elif tag_type == "move_file":
+            src = m.group(2).strip()
+            dst = m.group(4).strip()
+            res = tool_move_file(target_dir, src, dst)
+            format_and_print_tool_call("move_file", f"src='{src}' dst='{dst}'", res)
+            results.append({"tool": "move_file", "path": f"{src} -> {dst}", "result": res})
+
     return results
 
 TOOL_RESULT_PREFIX = "### Execution result of "

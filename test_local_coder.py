@@ -75,6 +75,39 @@ class TestLocalCoder(unittest.TestCase):
         patch_res2 = local_coder.tool_patch_file(self.test_dir, "math_utils_2.py", "def a():\n  pass", "def a():\n  return 1")
         self.assertIn("Error: Search block found multiple times", patch_res2)
 
+    def test_tool_delete_file(self):
+        # Create a file
+        local_coder.tool_write_file(self.test_dir, "delete_me.txt", "content")
+        self.assertTrue((self.test_dir / "delete_me.txt").exists())
+
+        # Delete it
+        res = local_coder.tool_delete_file(self.test_dir, "delete_me.txt")
+        self.assertIn("Successfully deleted", res)
+        self.assertFalse((self.test_dir / "delete_me.txt").exists())
+
+        # Path traversal should return error rather than throwing, as caught by the function's try-except block
+        # Actually wait, ValueError is raised by get_safe_path, then caught by the try-except in tool_delete_file
+        # and returned as string.
+        res2 = local_coder.tool_delete_file(self.test_dir, "../out_of_bounds.txt")
+        self.assertIn("Error deleting file:", res2)
+        self.assertIn("escapes target directory", res2)
+
+    def test_tool_move_file(self):
+        # Create a file
+        local_coder.tool_write_file(self.test_dir, "move_src.txt", "content")
+        self.assertTrue((self.test_dir / "move_src.txt").exists())
+
+        # Move it
+        res = local_coder.tool_move_file(self.test_dir, "move_src.txt", "subdir/move_dst.txt")
+        self.assertIn("Successfully moved", res)
+        self.assertFalse((self.test_dir / "move_src.txt").exists())
+        self.assertTrue((self.test_dir / "subdir" / "move_dst.txt").exists())
+
+        # Path traversal
+        res2 = local_coder.tool_move_file(self.test_dir, "subdir/move_dst.txt", "../escaped.txt")
+        self.assertIn("Error moving file:", res2)
+        self.assertIn("escapes target directory", res2)
+
     def test_parse_and_execute_tools(self):
         import textwrap
         # We simulate the LLM's response containing multiple tool blocks

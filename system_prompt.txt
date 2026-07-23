@@ -35,6 +35,16 @@ To perform actions, you MUST use the following XML tags in your response. You ca
    </replace>
    </patch_file>
 
+5. **Delete File**
+   Deletes an existing file.
+   Syntax:
+   <delete_file>path/to/file</delete_file>
+
+6. **Move/Rename File**
+   Moves or renames a file.
+   Syntax:
+   <move_file src="path/to/source" dst="path/to/destination"/>
+
 ### Guidelines:
 - Analyze the user request and explore the directory first if needed.
 - Write clean, well-structured code.
