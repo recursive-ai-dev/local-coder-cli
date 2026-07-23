@@ -104,6 +104,49 @@ class TestLocalCoder(unittest.TestCase):
         self.assertEqual(prov, None)
         self.assertEqual(url, None)
 
+    def test_get_all_agents(self):
+        import unittest.mock as mock
+        import json
+
+        # We need a temporary agents directory
+        agents_dir = self.test_dir / "agents"
+        agents_dir.mkdir()
+
+        # Create a mock agent file
+        mock_agent_path = agents_dir / "mock_agent.json"
+        mock_agent_data = {
+            "name": "Mock Agent",
+            "description": "A mock agent for testing.",
+            "system_prompt": "Mock system prompt.",
+            "allowed_tools": ["read_file"]
+        }
+        with open(mock_agent_path, "w") as f:
+            json.dump(mock_agent_data, f)
+
+        with mock.patch("local_coder.get_agents_dir", return_value=agents_dir):
+            agents = local_coder.get_all_agents()
+            self.assertIn("mock_agent", agents)
+            self.assertEqual(agents["mock_agent"]["name"], "Mock Agent")
+            self.assertIn("coder", agents) # Should still have built-ins
+
+    def test_restricted_tools(self):
+        import textwrap
+        llm_response = textwrap.dedent("""\
+            <write_file path="script.py" lang="python">
+            print("Hello CLI")
+            </write_file>
+        """)
+
+        # Allowed tools empty / restricted
+        results = local_coder.parse_and_execute_tools(self.test_dir, llm_response, allowed_tools=["read_file"])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "write_file")
+        self.assertIn("Error: Tool 'write_file' is not allowed", results[0]["result"])
+
+        # Not allowed -> no file written
+        file_path = self.test_dir / "script.py"
+        self.assertFalse(file_path.exists())
+
     def test_models_integration(self):
         # Check presets exist
         self.assertIn("1", local_coder.MODELS_PRESETS)

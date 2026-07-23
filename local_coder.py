@@ -2,6 +2,7 @@
 import os
 import time
 import sys
+import json
 import re
 import argparse
 import subprocess
@@ -29,6 +30,27 @@ from textual import work
 
 console = Console()
 TUI_MODE = False
+
+BUILTIN_AGENTS = {
+    "coder": {
+        "name": "Coder",
+        "description": "Full-featured coding agent with read/write access to the local filesystem.",
+        "system_prompt": "You are a helpful coding assistant. You have local file system access. You can read, write, and patch files in the target directory to complete coding tasks.",
+        "allowed_tools": ["list_dir", "read_file", "write_file", "patch_file"]
+    },
+    "explorer": {
+        "name": "Explorer",
+        "description": "Read-only agent for exploring the codebase and answering questions. Cannot write or modify files.",
+        "system_prompt": "You are a read-only exploration assistant. You can list directories and read files to answer questions about the codebase, but you cannot make any changes.",
+        "allowed_tools": ["list_dir", "read_file"]
+    },
+    "reviewer": {
+        "name": "Reviewer",
+        "description": "Read-only agent for reviewing code. Cannot write or modify files.",
+        "system_prompt": "You are a strict code reviewer. Read the requested files and provide constructive feedback on bugs, style, and structure. You cannot modify the files.",
+        "allowed_tools": ["list_dir", "read_file"]
+    }
+}
 
 MODELS_PRESETS = {
     "1": {
@@ -76,6 +98,66 @@ def get_models_dir() -> Path:
         m_dir = Path(__file__).parent / "models"
     m_dir.mkdir(parents=True, exist_ok=True)
     return m_dir
+
+def get_agents_dir() -> Path:
+    if getattr(sys, 'frozen', False):
+        a_dir = Path(sys.executable).parent / "agents"
+    else:
+        a_dir = Path(__file__).parent / "agents"
+    a_dir.mkdir(parents=True, exist_ok=True)
+    return a_dir
+
+def get_all_agents() -> dict:
+    agents = BUILTIN_AGENTS.copy()
+    a_dir = get_agents_dir()
+    for file_path in a_dir.glob("*.json"):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if "name" in data and "description" in data:
+                    agents[file_path.stem] = data
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not load agent profile from {file_path}: {e}[/yellow]")
+    return agents
+
+def print_list_agents():
+    agents = get_all_agents()
+    table = Table(title="Available Agent Profiles", show_header=True, header_style="bold magenta")
+    table.add_column("Key", style="cyan")
+    table.add_column("Name", style="green")
+    table.add_column("Type", style="dim")
+    table.add_column("Description", style="white")
+    table.add_column("Allowed Tools", style="blue")
+
+    for key, data in agents.items():
+        agent_type = "Built-in" if key in BUILTIN_AGENTS else "Custom"
+        allowed = ", ".join(data.get("allowed_tools", []))
+        table.add_row(key, data.get("name", "Unknown"), agent_type, data.get("description", ""), allowed)
+
+    console.print(table)
+
+def scaffold_create_agent(name: str):
+    a_dir = get_agents_dir()
+    file_path = a_dir / f"{name}.json"
+    if file_path.exists():
+        console.print(f"[bold red]Error: Agent profile '{name}' already exists at {file_path}[/bold red]")
+        sys.exit(1)
+
+    template = {
+        "name": name.title(),
+        "description": "A custom agent profile.",
+        "system_prompt": "You are a helpful coding assistant. You have local file system access.",
+        "allowed_tools": ["list_dir", "read_file", "write_file", "patch_file"]
+    }
+
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(template, f, indent=4)
+        console.print(f"[bold green]✔ Successfully created custom agent profile '{name}' at {file_path}[/bold green]")
+        console.print("Edit this file to customize the agent's behavior.")
+    except Exception as e:
+        console.print(f"[bold red]Error creating agent profile:[/bold red] {e}")
+        sys.exit(1)
 
 def get_safe_path(target_dir: Path, subpath_str: str) -> Path:
     """Resolve subpath safely, ensuring it is within the target directory."""
@@ -234,7 +316,7 @@ def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
     else:
         console.print(Panel(result, border_style="cyan", title="Tool Result"))
 
-def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
+def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str] = None) -> list[dict]:
     """Parse XML tags in response and execute tools in the order they appear."""
     matches = []
     
@@ -254,6 +336,12 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
     
     results = []
     for _, tag_type, m in matches:
+        if allowed_tools is not None and tag_type not in allowed_tools:
+            res = f"Error: Tool '{tag_type}' is not allowed for the current agent profile."
+            format_and_print_tool_call(tag_type, "N/A", res)
+            results.append({"tool": tag_type, "path": "N/A", "result": res})
+            continue
+
         if tag_type == "list_dir":
             path = m.group(1).strip()
             res = tool_list_dir(target_dir, path)
@@ -356,7 +444,7 @@ def build_tool_result_message(tool_results: list[dict]) -> str:
     ]
     return "\n".join(parts)
 
-def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int):
+def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int, allowed_tools: list[str] = None):
     """Executes the agentic reasoning & execution loop with live updates."""
     for i in range(1, max_iterations + 1):
         console.print(f"\n[bold blue]🤖 Agent Thinking (Step {i}/{max_iterations}) ...[/bold blue]")
@@ -382,7 +470,7 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
 
         messages.append({"role": "assistant", "content": assistant_response})
 
-        tool_results = parse_and_execute_tools(target_dir, assistant_response)
+        tool_results = parse_and_execute_tools(target_dir, assistant_response, allowed_tools)
 
         if not tool_results:
             console.print("[bold green]✔ No tools triggered or task complete.[/bold green]")
@@ -708,7 +796,7 @@ class LocalCoderApp(App):
     }
     """
     
-    def __init__(self, client, model, target_dir, messages, agent_mode, max_iterations):
+    def __init__(self, client, model, target_dir, messages, agent_mode, max_iterations, allowed_tools: list[str] = None):
         super().__init__()
         self.client = client
         self.model = model
@@ -716,6 +804,7 @@ class LocalCoderApp(App):
         self.messages = messages
         self.agent_mode = agent_mode
         self.max_iterations = max_iterations
+        self.allowed_tools = allowed_tools
         self.is_processing = False
 
     def compose(self) -> ComposeResult:
@@ -841,7 +930,7 @@ class LocalCoderApp(App):
                 self.messages.append({"role": "assistant", "content": assistant_response})
 
                 # Execute tools
-                tool_results = parse_and_execute_tools(self.target_dir, assistant_response)
+                tool_results = parse_and_execute_tools(self.target_dir, assistant_response, self.allowed_tools)
 
                 if not tool_results:
                     self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))
@@ -875,10 +964,21 @@ def main():
     parser.add_argument("--agent", action="store_true", help="Enable autonomous agent loop with filesystem tools")
     parser.add_argument("--max-iterations", type=int, default=10, help="Maximum number of loop iterations for agent mode")
     parser.add_argument("-i", "--interactive", action="store_true", help="Force launch the interactive REPL shell")
+    parser.add_argument("--list-agents", action="store_true", help="List all available agent profiles and exit")
+    parser.add_argument("--create-agent", type=str, help="Scaffold a new agent profile JSON with the given name")
+    parser.add_argument("--agent-profile", type=str, help="Load a specific agent profile (overrides default agent behavior)")
     parser.add_argument("prompt", nargs="?", help="The programming task / instruction for the LLM")
     
     args = parser.parse_args()
     
+    if args.list_agents:
+        print_list_agents()
+        sys.exit(0)
+
+    if args.create_agent:
+        scaffold_create_agent(args.create_agent)
+        sys.exit(0)
+
     provider, api_url, api_key, model = resolve_provider_config(
         args.provider, args.api_url, args.api_key, args.model
     )
@@ -888,8 +988,20 @@ def main():
         console.print(f"[bold yellow]Target directory '{target_dir}' does not exist. Creating it...[/bold yellow]")
         target_dir.mkdir(parents=True, exist_ok=True)
         
+    allowed_tools = None
     system_prompt_content = ""
-    if args.system_prompt:
+
+    if args.agent_profile:
+        agents = get_all_agents()
+        if args.agent_profile not in agents:
+            console.print(f"[bold red]Error: Agent profile '{args.agent_profile}' not found.[/bold red]")
+            console.print("Use --list-agents to see available profiles.")
+            sys.exit(1)
+        profile = agents[args.agent_profile]
+        system_prompt_content = profile.get("system_prompt", "You are a helpful coding assistant.")
+        allowed_tools = profile.get("allowed_tools")
+        args.agent = True # Force agent mode when using a profile
+    elif args.system_prompt:
         sys_prompt_path = Path(args.system_prompt)
         if sys_prompt_path.exists():
             system_prompt_content = sys_prompt_path.read_text(encoding="utf-8")
@@ -917,13 +1029,13 @@ def main():
     if is_interactive:
         global TUI_MODE
         TUI_MODE = True
-        app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations)
+        app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations, allowed_tools)
         app.run()
     else:
         messages.append({"role": "user", "content": args.prompt})
         console.print(Panel(f"[bold green]Target Directory:[/bold green] {target_dir.resolve()}\n[bold green]Provider:[/bold green] {provider} ({api_url})\n[bold green]Task:[/bold green] {args.prompt}", title="Agent Run Started"))
         if args.agent:
-            run_agent_loop(client, model, target_dir, messages, args.max_iterations)
+            run_agent_loop(client, model, target_dir, messages, args.max_iterations, allowed_tools)
         else:
             run_single_prompt(client, model, messages)
 
