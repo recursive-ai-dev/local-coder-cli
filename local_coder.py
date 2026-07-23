@@ -8,6 +8,7 @@ import argparse
 import subprocess
 import atexit
 import socket
+import json
 import threading
 import concurrent.futures
 from pathlib import Path
@@ -80,6 +81,28 @@ def get_models_dir() -> Path:
         m_dir = Path(__file__).parent / "models"
     m_dir.mkdir(parents=True, exist_ok=True)
     return m_dir
+
+def load_agent_config(target_dir: Path, name: str) -> dict:
+    """Load subagent configuration from target_dir/.local-coder/agents/{name}.json
+    or fallback to bundled models/agents directory."""
+    try:
+        agent_file = get_safe_path(target_dir, f".local-coder/agents/{name}.json")
+        if agent_file.exists():
+            return json.loads(agent_file.read_text(encoding="utf-8"))
+    except ValueError:
+        pass
+
+    # Fallback to bundled
+    if getattr(sys, 'frozen', False):
+        m_dir = Path(sys.executable).parent / "agents"
+    else:
+        m_dir = Path(__file__).parent / "agents"
+
+    fallback_file = m_dir / f"{name}.json"
+    if fallback_file.exists():
+        return json.loads(fallback_file.read_text(encoding="utf-8"))
+
+    raise FileNotFoundError(f"Agent config '{name}.json' not found in target dir or bundled agents dir.")
 
 def get_safe_path(target_dir: Path, subpath_str: str) -> Path:
     """Resolve subpath safely, ensuring it is within the target directory."""
@@ -281,6 +304,7 @@ def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
     else:
         console.print(Panel(result, border_style="cyan", title="Tool Result"))
 
+def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str] = None, subagent_runner=None) -> list[dict]:
 def ask_user_confirmation(tool_name: str, path: str, preview: str) -> bool:
     if _YOLO_MODE:
         return True
@@ -319,6 +343,9 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
         
     for m in re.finditer(r"<patch_file\s+path=([\"']?)(.*?)\1[^>]*>\s*<search>(.*?)</search>\s*<replace>(.*?)</replace>\s*</patch_file\s*>", text, re.DOTALL):
         matches.append((m.start(), "patch_file", m))
+
+    for m in re.finditer(r"<spawn_agent\s+name=([\"']?)(.*?)\1[^>]*>(.*?)</spawn_agent\s*>", text, re.DOTALL):
+        matches.append((m.start(), "spawn_agent", m))
         
     for m in re.finditer(r"<delete_file>(.*?)</delete_file\s*>", text, re.DOTALL):
         matches.append((m.start(), "delete_file", m))
@@ -330,6 +357,12 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
     
     results = []
     for _, tag_type, m in matches:
+        if allowed_tools is not None and tag_type not in allowed_tools:
+            res = f"Error: Tool '{tag_type}' is not permitted by this agent's configuration."
+            format_and_print_tool_call(tag_type, "N/A", res)
+            results.append({"tool": tag_type, "path": "N/A", "result": res})
+            continue
+
         if tag_type == "list_dir":
             path = m.group(1).strip()
             res = tool_list_dir(target_dir, path)
@@ -374,6 +407,15 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
             format_and_print_tool_call("patch_file", path, res)
             results.append({"tool": "patch_file", "path": path, "result": res})
             
+        elif tag_type == "spawn_agent":
+            name = m.group(2).strip()
+            task = m.group(3).strip()
+            if subagent_runner is None:
+                res = "Error: Subagents cannot be spawned in this context."
+            else:
+                res = subagent_runner(name, task)
+            format_and_print_tool_call("spawn_agent", name, res)
+            results.append({"tool": "spawn_agent", "path": name, "result": res})
         elif tag_type == "delete_file":
             path = m.group(1).strip()
             res = tool_delete_file(target_dir, path)
@@ -456,8 +498,124 @@ def build_tool_result_message(tool_results: list[dict]) -> str:
     ]
     return "\n".join(parts)
 
+def run_subagent(client: OpenAI, model: str, target_dir: Path, agent_name: str, task: str, depth: int = 0, tui_app = None) -> str:
+    """Executes a subagent with a separate message history based on its configuration."""
+    if depth > 5:
+        return f"Error: Maximum subagent depth exceeded."
+
+    try:
+        config = load_agent_config(target_dir, agent_name)
+    except FileNotFoundError as e:
+        return f"Error loading subagent '{agent_name}': {e}"
+
+    system_prompt = config.get("system_prompt", "You are a subagent. Do your task.")
+    max_iterations = config.get("max_iterations", 5)
+    allowed_tools = config.get("allowed_tools", None)
+
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": task}]
+
+    subagent_runner_callable = lambda n, task: run_subagent(client, model, target_dir, n, task, depth + 1, tui_app)
+
+    prefix = "  " * depth
+    if tui_app:
+        tui_app.call_from_thread(tui_app.chat_history.mount, ChatMessage(f"🚀 Spawning subagent '{agent_name}': {task}", "system"))
+        tui_app.call_after_refresh(tui_app.chat_history.scroll_end, animate=False)
+    else:
+        console.print(f"\n[bold magenta]{prefix}🚀 Spawning subagent '{agent_name}' for task: {task}[/bold magenta]")
+
+    for i in range(1, max_iterations + 1):
+        if not tui_app:
+            console.print(f"[bold magenta]{prefix}🤖 Subagent '{agent_name}' Thinking (Step {i}/{max_iterations}) ...[/bold magenta]")
+
+        assistant_response = ""
+        try:
+            if tui_app:
+                stream_msg = StreamMessage(f"Subagent '{agent_name}' (Step {i})")
+                tui_app.call_from_thread(tui_app.chat_history.mount, stream_msg)
+
+                def on_update_tui(text, _stream_msg=stream_msg):
+                    tui_app.call_from_thread(_stream_msg.update_content, text)
+                    tui_app.call_from_thread(tui_app.chat_history.scroll_end, animate=False)
+
+                assistant_response = stream_completion(client, model, messages, on_update_tui)
+            else:
+                with Live(console=console, refresh_per_second=8) as live:
+                    def on_update_cli(text):
+                        live.update(Panel(Markdown(text), title=f"[bold green]Subagent '{agent_name}' (Step {i})[/bold green]", border_style="magenta"))
+                    assistant_response = stream_completion(client, model, messages, on_update_cli)
+        except StreamInterrupted as e:
+            if not tui_app:
+                console.print(f"[bold yellow]{prefix}Generation interrupted by user.[/bold yellow]")
+            assistant_response = e.partial_text
+            if not assistant_response:
+                break
+        except Exception as e:
+            if not tui_app:
+                console.print(f"[bold red]{prefix}API call failed:[/bold red] {e}")
+            break
+
+        if not assistant_response:
+            if not tui_app:
+                console.print(f"[bold red]{prefix}Received empty response from the model.[/bold red]")
+            break
+
+        messages.append({"role": "assistant", "content": assistant_response})
+
+        tool_results = parse_and_execute_tools(target_dir, assistant_response, allowed_tools=allowed_tools, subagent_runner=subagent_runner_callable)
+
+        if not tool_results:
+            if tui_app:
+                tui_app.call_from_thread(tui_app.chat_history.mount, ChatMessage(f"✔ Subagent '{agent_name}' finished.", "system"))
+                tui_app.call_after_refresh(tui_app.chat_history.scroll_end, animate=False)
+            else:
+                console.print(f"[bold green]{prefix}✔ Subagent '{agent_name}' finished.[/bold green]")
+            break
+
+        if tui_app:
+            for tr in tool_results:
+                tui_app.call_from_thread(tui_app.chat_history.mount, ChatMessage(f"Tool {tr['tool']} on {tr.get('path', 'n/a')}:\n{tr['result'][:100]}...", "system"))
+            tui_app.call_after_refresh(tui_app.chat_history.scroll_end, animate=False)
+
+        result_message = build_tool_result_message(tool_results)
+        if not tui_app:
+            console.print(f"[bold cyan]{prefix}Sending tool results back to '{agent_name}'...[/bold cyan]")
+
+        messages.append({"role": "user", "content": result_message, "is_tool_result": True})
+        compact_old_tool_results(messages)
+
+    # Summarize result
+    if tui_app:
+        tui_app.call_from_thread(tui_app.chat_history.mount, ChatMessage(f"📝 Subagent '{agent_name}' summarizing results...", "system"))
+        tui_app.call_after_refresh(tui_app.chat_history.scroll_end, animate=False)
+    else:
+        console.print(f"[bold magenta]{prefix}📝 Subagent '{agent_name}' summarizing results...[/bold magenta]")
+
+    messages.append({"role": "user", "content": "Please provide a concise summary of what you accomplished and the final result for the main agent."})
+    summary_response = ""
+    try:
+        if tui_app:
+            stream_msg = StreamMessage(f"Subagent '{agent_name}' Summary")
+            tui_app.call_from_thread(tui_app.chat_history.mount, stream_msg)
+
+            def on_update_summary_tui(text, _stream_msg=stream_msg):
+                tui_app.call_from_thread(_stream_msg.update_content, text)
+                tui_app.call_from_thread(tui_app.chat_history.scroll_end, animate=False)
+
+            summary_response = stream_completion(client, model, messages, on_update_summary_tui)
+        else:
+            with Live(console=console, refresh_per_second=8) as live:
+                def on_update_summary_cli(text):
+                    live.update(Panel(Markdown(text), title=f"[bold green]Subagent '{agent_name}' Summary[/bold green]", border_style="magenta"))
+                summary_response = stream_completion(client, model, messages, on_update_summary_cli)
+    except Exception as e:
+        summary_response = f"Error generating summary: {e}"
+
+    return f"Subagent '{agent_name}' completed. Summary:\n{summary_response}"
+
 def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[dict], max_iterations: int):
     """Executes the agentic reasoning & execution loop with live updates."""
+    subagent_runner_callable = lambda n, task: run_subagent(client, model, target_dir, n, task, depth=1)
+
     for i in range(1, max_iterations + 1):
         console.print(f"\n[bold blue]🤖 Agent Thinking (Step {i}/{max_iterations}) ...[/bold blue]")
 
@@ -482,7 +640,7 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
 
         messages.append({"role": "assistant", "content": assistant_response})
 
-        tool_results = parse_and_execute_tools(target_dir, assistant_response)
+        tool_results = parse_and_execute_tools(target_dir, assistant_response, subagent_runner=subagent_runner_callable)
 
         if not tool_results:
             console.print("[bold green]✔ No tools triggered or task complete.[/bold green]")
@@ -976,6 +1134,7 @@ class LocalCoderApp(App):
 
     @work(thread=True)
     def run_agent_loop_async(self):
+        subagent_runner_callable = lambda n, task: run_subagent(self.client, self.model, self.target_dir, n, task, depth=1, tui_app=self)
         try:
             for i in range(1, self.max_iterations + 1):
                 self.call_from_thread(self.chat_history.mount, ChatMessage(f"🤖 Agent Thinking (Step {i}/{self.max_iterations}) ...", "system"))
@@ -993,7 +1152,7 @@ class LocalCoderApp(App):
                 self.messages.append({"role": "assistant", "content": assistant_response})
 
                 # Execute tools
-                tool_results = parse_and_execute_tools(self.target_dir, assistant_response)
+                tool_results = parse_and_execute_tools(self.target_dir, assistant_response, subagent_runner=subagent_runner_callable)
 
                 if not tool_results:
                     self.call_from_thread(self.chat_history.mount, ChatMessage("✔ No tools triggered or task complete.", "system"))
