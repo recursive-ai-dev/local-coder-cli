@@ -35,6 +35,13 @@ To perform actions, you MUST use the following XML tags in your response. You ca
    </replace>
    </patch_file>
 
+5. **Spawn Subagent**
+   Spawns a specialized subagent to perform a specific task autonomously.
+   Syntax:
+   <spawn_agent name="agent_name">
+   Description of the task for the subagent to perform
+   </spawn_agent>
+
 ### Guidelines:
 - Analyze the user request and explore the directory first if needed.
 - Write clean, well-structured code.

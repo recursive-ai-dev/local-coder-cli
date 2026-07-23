@@ -13,6 +13,23 @@ class TestLocalCoder(unittest.TestCase):
         # Clean up temporary directory
         shutil.rmtree(self.test_dir)
         
+    def test_load_agent_config(self):
+        import json
+        agents_dir = self.test_dir / ".local-coder" / "agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        config_data = {
+            "system_prompt": "Test agent prompt",
+            "allowed_tools": ["read_file", "list_dir"]
+        }
+        (agents_dir / "test_agent.json").write_text(json.dumps(config_data), encoding="utf-8")
+
+        config = local_coder.load_agent_config(self.test_dir, "test_agent")
+        self.assertEqual(config["system_prompt"], "Test agent prompt")
+        self.assertEqual(config["allowed_tools"], ["read_file", "list_dir"])
+
+        with self.assertRaises(FileNotFoundError):
+            local_coder.load_agent_config(self.test_dir, "missing_agent")
+
     def test_safe_path_resolution(self):
         # Normal resolution
         path = local_coder.get_safe_path(self.test_dir, "subdir/file.txt")
@@ -97,6 +114,38 @@ class TestLocalCoder(unittest.TestCase):
         self.assertEqual(results[1]["tool"], "read_file")
         self.assertEqual(results[1]["path"], "script.py")
         self.assertEqual(results[1]["result"], 'print("Hello CLI")\n')
+
+    def test_spawn_agent_parsing(self):
+        llm_response = """\
+        Let's run a subtask.
+        <spawn_agent name="helper">
+        Analyze the directory.
+        </spawn_agent>
+        """
+        def mock_runner(name, task):
+            return f"Mock ran {name} with task {task}"
+
+        results = local_coder.parse_and_execute_tools(self.test_dir, llm_response, subagent_runner=mock_runner)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "spawn_agent")
+        self.assertEqual(results[0]["path"], "helper")
+        self.assertEqual(results[0]["result"], "Mock ran helper with task Analyze the directory.")
+
+    def test_tool_filtering(self):
+        llm_response = """\
+        <write_file path="x.txt">test</write_file>
+        <read_file>x.txt</read_file>
+        """
+        results = local_coder.parse_and_execute_tools(self.test_dir, llm_response, allowed_tools=["read_file"])
+        self.assertEqual(len(results), 2)
+
+        # write_file should be blocked
+        self.assertEqual(results[0]["tool"], "write_file")
+        self.assertIn("not permitted", results[0]["result"])
+
+        # read_file should attempt to run (and fail since x.txt wasn't written)
+        self.assertEqual(results[1]["tool"], "read_file")
+        self.assertIn("Error: File 'x.txt' does not exist.", results[1]["result"])
 
     def test_provider_detection_fallback(self):
         # When no endpoints are active, detect_provider returns (None, None)
