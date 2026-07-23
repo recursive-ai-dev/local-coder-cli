@@ -7,6 +7,7 @@ import argparse
 import subprocess
 import atexit
 import socket
+import threading
 import concurrent.futures
 from pathlib import Path
 import httpx
@@ -17,7 +18,7 @@ from rich.syntax import Syntax
 from rich.live import Live
 from rich.table import Table
 from rich.markdown import Markdown
-from rich.prompt import Prompt
+from rich.prompt import Prompt, Confirm
 from rich.align import Align
 
 from textual.app import App, ComposeResult
@@ -29,6 +30,8 @@ from textual import work
 
 console = Console()
 TUI_MODE = False
+_YOLO_MODE = False
+_APP_INSTANCE = None
 
 MODELS_PRESETS = {
     "1": {
@@ -234,6 +237,29 @@ def format_and_print_tool_call(tool_name: str, args_info: str, result: str):
     else:
         console.print(Panel(result, border_style="cyan", title="Tool Result"))
 
+def ask_user_confirmation(tool_name: str, path: str, preview: str) -> bool:
+    if _YOLO_MODE:
+        return True
+
+    title = f"{tool_name} on '{path}'"
+    if not TUI_MODE:
+        console.print(Panel(Syntax(preview, "python", theme="monokai"), title=f"Preview: {title}", border_style="yellow"))
+        return Confirm.ask(f"[bold yellow]Allow {tool_name} on {path}?[/bold yellow]")
+
+    # TUI Mode
+    result_event = threading.Event()
+    user_decision = []
+
+    def on_dismiss(result: bool):
+        user_decision.append(result)
+        result_event.set()
+
+    screen = ConfirmationScreen(title, preview)
+    _APP_INSTANCE.call_from_thread(_APP_INSTANCE.push_screen, screen, on_dismiss)
+
+    result_event.wait()
+    return user_decision[0] if user_decision else False
+
 def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
     """Parse XML tags in response and execute tools in the order they appear."""
     matches = []
@@ -271,6 +297,11 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
             content = m.group(3)
             if content.startswith("\n"):
                 content = content[1:]
+
+            if not ask_user_confirmation("write_file", path, content):
+                results.append({"tool": "write_file", "path": path, "result": "Error: User denied permission to write file."})
+                continue
+
             res = tool_write_file(target_dir, path, content)
             format_and_print_tool_call("write_file", path, res)
             results.append({"tool": "write_file", "path": path, "result": res})
@@ -283,6 +314,12 @@ def parse_and_execute_tools(target_dir: Path, text: str) -> list[dict]:
                 search = search[1:]
             if replace.startswith("\n"):
                 replace = replace[1:]
+
+            preview = f"Search:\n{search}\n\nReplace:\n{replace}"
+            if not ask_user_confirmation("patch_file", path, preview):
+                results.append({"tool": "patch_file", "path": path, "result": "Error: User denied permission to patch file."})
+                continue
+
             res = tool_patch_file(target_dir, path, search, replace)
             format_and_print_tool_call("patch_file", path, res)
             results.append({"tool": "patch_file", "path": path, "result": res})
@@ -568,6 +605,56 @@ class DownloadModelScreen(ModalScreen):
                 destination_file.unlink()
             self.app.call_from_thread(status.update, f"Error: {e}")
             self.app.call_from_thread(self.query_one("#cancel-btn").__setattr__, "disabled", False)
+
+class ConfirmationScreen(ModalScreen[bool]):
+    CSS = """
+    ConfirmationScreen {
+        align: center middle;
+    }
+    #confirm-dialog {
+        padding: 1 2;
+        width: 80%;
+        height: auto;
+        border: thick $background 80%;
+        background: $surface;
+    }
+    #preview-scroll {
+        height: 1fr;
+        max-height: 20;
+        border: solid $primary;
+        margin: 1 0;
+    }
+    """
+
+    BINDINGS = [
+        ("y", "confirm(True)", "Yes (Approve)"),
+        ("n", "confirm(False)", "No (Deny)"),
+    ]
+
+    def __init__(self, title: str, preview: str):
+        super().__init__()
+        self.dialog_title = title
+        self.preview_content = preview
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Label(f"[bold yellow]Requires Permission:[/bold yellow] {self.dialog_title}")
+            with VerticalScroll(id="preview-scroll"):
+                yield Static(self.preview_content)
+            yield Label("Press [bold green]'y'[/bold green] to allow, or [bold red]'n'[/bold red] to deny.")
+            with Horizontal():
+                yield Button("Yes (y)", variant="success", id="btn-yes")
+                yield Button("No (n)", variant="error", id="btn-no")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-yes":
+            self.dismiss(True)
+        elif event.button.id == "btn-no":
+            self.dismiss(False)
+
+    def action_confirm(self, result: bool) -> None:
+        self.dismiss(result)
+
 
 class ServeModelScreen(ModalScreen):
     CSS = """
@@ -875,10 +962,16 @@ def main():
     parser.add_argument("--agent", action="store_true", help="Enable autonomous agent loop with filesystem tools")
     parser.add_argument("--max-iterations", type=int, default=10, help="Maximum number of loop iterations for agent mode")
     parser.add_argument("-i", "--interactive", action="store_true", help="Force launch the interactive REPL shell")
+    parser.add_argument("--yolo", action="store_true", help="Auto-approve destructive operations (no prompts)")
+    parser.add_argument("--auto-approve", action="store_true", help="Alias for --yolo")
     parser.add_argument("prompt", nargs="?", help="The programming task / instruction for the LLM")
     
     args = parser.parse_args()
     
+    global _YOLO_MODE
+    if args.yolo or args.auto_approve:
+        _YOLO_MODE = True
+
     provider, api_url, api_key, model = resolve_provider_config(
         args.provider, args.api_url, args.api_key, args.model
     )
@@ -915,9 +1008,10 @@ def main():
     
 
     if is_interactive:
-        global TUI_MODE
+        global TUI_MODE, _APP_INSTANCE
         TUI_MODE = True
         app = LocalCoderApp(client, model, target_dir, messages, args.agent, args.max_iterations)
+        _APP_INSTANCE = app
         app.run()
     else:
         messages.append({"role": "user", "content": args.prompt})
