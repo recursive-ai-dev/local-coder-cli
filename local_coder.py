@@ -34,6 +34,7 @@ console = Console()
 TUI_MODE = False
 _YOLO_MODE = False
 _SHOW_IGNORED = False
+_MAX_HISTORY = 20
 _APP_INSTANCE = None
 
 MODELS_PRESETS = {
@@ -573,6 +574,20 @@ def compact_old_tool_results(messages: list[dict], keep_last: int = 1) -> None:
             f"[Tool result omitted to save context — {len(content)} chars, already processed by the agent]"
         )
 
+def trim_messages_context(messages: list[dict], max_history: int = 20) -> None:
+    """Trim the actual list of messages to prevent LLM context limit errors.
+
+    Drops the oldest turns in pairs to preserve role alternation where possible,
+    while always keeping the system prompt at messages[0].
+    """
+    if max_history < 3:
+        max_history = 3
+
+    while len(messages) > max_history and len(messages) > 3:
+        # Preserve messages[0] (system prompt). Pop index 1 and 2 (which becomes 1 after first pop)
+        messages.pop(1)
+        messages.pop(1)
+
 class StreamInterrupted(Exception):
     """Raised when a user interrupts an in-progress stream (console mode only)."""
     def __init__(self, partial_text: str):
@@ -704,6 +719,7 @@ def run_subagent(client: OpenAI, model: str, target_dir: Path, agent_name: str, 
 
         messages.append({"role": "user", "content": result_message, "is_tool_result": True})
         compact_old_tool_results(messages)
+        trim_messages_context(messages, _MAX_HISTORY)
 
     # Summarize result
     if tui_app:
@@ -772,6 +788,7 @@ def run_agent_loop(client: OpenAI, model: str, target_dir: Path, messages: list[
         console.print(f"[bold cyan]Sending tool results back to LLM...[/bold cyan]")
         messages.append({"role": "user", "content": result_message, "is_tool_result": True})
         compact_old_tool_results(messages)
+        trim_messages_context(messages, _MAX_HISTORY)
 
     return messages
 
@@ -1289,6 +1306,7 @@ class LocalCoderApp(App):
                 result_message = build_tool_result_message(tool_results)
                 self.messages.append({"role": "user", "content": result_message, "is_tool_result": True})
                 compact_old_tool_results(self.messages)
+                trim_messages_context(self.messages, _MAX_HISTORY)
                 self.call_after_refresh(self.chat_history.scroll_end, animate=False)
                 self.call_from_thread(self._trim_chat_history)
 
@@ -1312,15 +1330,17 @@ def main():
     parser.add_argument("--yolo", action="store_true", help="Auto-approve destructive operations (no prompts)")
     parser.add_argument("--auto-approve", action="store_true", help="Alias for --yolo")
     parser.add_argument("--show-ignored", action="store_true", help="Do not filter out .git and .gitignore-matched files in directory listings")
+    parser.add_argument("--max-history", type=int, default=20, help="Maximum number of messages to keep in context (rolling window)")
     parser.add_argument("prompt", nargs="?", help="The programming task / instruction for the LLM")
-    
+
     args = parser.parse_args()
-    
-    global _YOLO_MODE, _SHOW_IGNORED
+
+    global _YOLO_MODE, _SHOW_IGNORED, _MAX_HISTORY
     if args.yolo or args.auto_approve:
         _YOLO_MODE = True
     if args.show_ignored:
         _SHOW_IGNORED = True
+    _MAX_HISTORY = args.max_history
 
     provider, api_url, api_key, model = resolve_provider_config(
         args.provider, args.api_url, args.api_key, args.model

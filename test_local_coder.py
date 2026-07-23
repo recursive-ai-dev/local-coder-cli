@@ -252,6 +252,35 @@ class TestLocalCoder(unittest.TestCase):
         self.assertTrue(m_dir.exists())
         self.assertTrue(m_dir.is_dir())
 
+    def test_trim_messages_context(self):
+        messages = [{"role": "system", "content": "You are a helpful bot."}]
+        for i in range(10):
+            messages.append({"role": "user", "content": f"User {i}"})
+            messages.append({"role": "assistant", "content": f"Bot {i}"})
+        self.assertEqual(len(messages), 21)
+
+        local_coder.trim_messages_context(messages, max_history=5)
+
+        self.assertEqual(len(messages), 5)
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[-4]["content"], "User 8")
+        self.assertEqual(messages[-3]["content"], "Bot 8")
+        self.assertEqual(messages[-2]["content"], "User 9")
+        self.assertEqual(messages[-1]["content"], "Bot 9")
+
+    def test_trim_messages_context_preserves_minimum_length(self):
+        messages = [{"role": "system", "content": "You are a helpful bot."},
+                    {"role": "user", "content": "A"},
+                    {"role": "assistant", "content": "B"},
+                    {"role": "user", "content": "C"},
+                    {"role": "assistant", "content": "D"}]
+
+        local_coder.trim_messages_context(messages, max_history=2)
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[1]["content"], "C")
+        self.assertEqual(messages[2]["content"], "D")
+
     def test_tool_search_files(self):
         (self.test_dir / "dir").mkdir()
         local_coder.tool_write_file(self.test_dir, "file1.txt", "apple\nbanana\ncherry\n")
