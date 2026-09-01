@@ -206,6 +206,98 @@ class TestLocalCoder(unittest.TestCase):
         file_path = self.test_dir / "good.py"
         self.assertTrue(file_path.exists())
 
+    def test_ask_user_confirmation_delete_deny(self):
+        import textwrap
+        from unittest.mock import patch
+
+        local_coder._YOLO_MODE = False
+        local_coder.TUI_MODE = False
+        local_coder.tool_write_file(self.test_dir, "delete_me.txt", "content")
+
+        llm_response = textwrap.dedent("""\
+            <delete_file>delete_me.txt</delete_file>
+        """)
+
+        with patch("local_coder.Confirm.ask", return_value=False):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "delete_file")
+        self.assertEqual(results[0]["path"], "delete_me.txt")
+        self.assertEqual(results[0]["result"], "Error: User denied permission to delete file.")
+
+        file_path = self.test_dir / "delete_me.txt"
+        self.assertTrue(file_path.exists())
+
+    def test_ask_user_confirmation_delete_allow(self):
+        import textwrap
+        from unittest.mock import patch
+
+        local_coder._YOLO_MODE = False
+        local_coder.TUI_MODE = False
+        local_coder.tool_write_file(self.test_dir, "delete_me.txt", "content")
+
+        llm_response = textwrap.dedent("""\
+            <delete_file>delete_me.txt</delete_file>
+        """)
+
+        with patch("local_coder.Confirm.ask", return_value=True):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "delete_file")
+        self.assertEqual(results[0]["path"], "delete_me.txt")
+        self.assertIn("Successfully deleted", results[0]["result"])
+
+        file_path = self.test_dir / "delete_me.txt"
+        self.assertFalse(file_path.exists())
+
+    def test_ask_user_confirmation_move_deny(self):
+        import textwrap
+        from unittest.mock import patch
+
+        local_coder._YOLO_MODE = False
+        local_coder.TUI_MODE = False
+        local_coder.tool_write_file(self.test_dir, "src.txt", "content")
+
+        llm_response = textwrap.dedent("""\
+            <move_file src="src.txt" dst="dst.txt" />
+        """)
+
+        with patch("local_coder.Confirm.ask", return_value=False):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "move_file")
+        self.assertEqual(results[0]["path"], "src.txt -> dst.txt")
+        self.assertEqual(results[0]["result"], "Error: User denied permission to move file.")
+
+        self.assertTrue((self.test_dir / "src.txt").exists())
+        self.assertFalse((self.test_dir / "dst.txt").exists())
+
+    def test_ask_user_confirmation_move_allow(self):
+        import textwrap
+        from unittest.mock import patch
+
+        local_coder._YOLO_MODE = False
+        local_coder.TUI_MODE = False
+        local_coder.tool_write_file(self.test_dir, "src.txt", "content")
+
+        llm_response = textwrap.dedent("""\
+            <move_file src="src.txt" dst="dst.txt" />
+        """)
+
+        with patch("local_coder.Confirm.ask", return_value=True):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "move_file")
+        self.assertEqual(results[0]["path"], "src.txt -> dst.txt")
+        self.assertIn("Successfully moved", results[0]["result"])
+
+        self.assertFalse((self.test_dir / "src.txt").exists())
+        self.assertTrue((self.test_dir / "dst.txt").exists())
+
     def test_spawn_agent_parsing(self):
         llm_response = """\
         Let's run a subtask.
@@ -571,7 +663,9 @@ class TestLocalCoder(unittest.TestCase):
             <list_dir>.</list_dir>
             <delete_file>2.txt</delete_file>
         """)
-        results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+        from unittest.mock import patch
+        with patch("local_coder.Confirm.ask", return_value=True):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
         self.assertEqual(len(results), 3)
         self.assertEqual(results[0]["tool"], "read_file")
         self.assertEqual(results[1]["tool"], "list_dir")
