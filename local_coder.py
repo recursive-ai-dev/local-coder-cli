@@ -829,38 +829,28 @@ def ask_user_confirmation(tool_name: str, path: str, preview: str) -> bool:
     result_event.wait()
     return user_decision[0] if user_decision else False
 
+_TAG_RE = re.compile(r"<(list_dir|read_file|search_files|write_file|patch_file|spawn_agent|delete_file|move_file|run_command)\b", re.DOTALL)
+_TOOL_PATTERNS = {
+    "list_dir": re.compile(r"<list_dir(?:[^>]*show_ignored=[\"'](true|false)[\"'])?[^>]*>(.*?)</list_dir\s*>", re.DOTALL),
+    "read_file": re.compile(r"<read_file>(.*?)</read_file\s*>", re.DOTALL),
+    "search_files": re.compile(r"<search_files(?:\s+path=([\"']?)(.*?)\1)?[^>]*>(.*?)</search_files\s*>", re.DOTALL),
+    "write_file": re.compile(r"<write_file\s+path=([\"']?)(.*?)\1[^>]*>(.*?)</write_file\s*>", re.DOTALL),
+    "patch_file": re.compile(r"<patch_file\s+path=([\"']?)(.*?)\1[^>]*>\s*<search>(.*?)</search>\s*<replace>(.*?)</replace>\s*</patch_file\s*>", re.DOTALL),
+    "spawn_agent": re.compile(r"<spawn_agent\s+name=([\"']?)(.*?)\1[^>]*>(.*?)</spawn_agent\s*>", re.DOTALL),
+    "delete_file": re.compile(r"<delete_file>(.*?)</delete_file\s*>", re.DOTALL),
+    "move_file": re.compile(r"<move_file\s+src=([\"']?)(.*?)\1\s+dst=([\"']?)(.*?)\3\s*/>", re.DOTALL),
+    "run_command": re.compile(r"<run_command>(.*?)</run_command\s*>", re.DOTALL)
+}
+
 def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str] = None, subagent_runner=None) -> list[dict]:
     """Parse XML tags in response and execute tools in the order they appear."""
     matches = []
     
-    for m in re.finditer(r"<list_dir(?:[^>]*show_ignored=[\"'](true|false)[\"'])?[^>]*>(.*?)</list_dir\s*>", text, re.DOTALL):
-        matches.append((m.start(), "list_dir", m))
-        
-    for m in re.finditer(r"<read_file>(.*?)</read_file\s*>", text, re.DOTALL):
-        matches.append((m.start(), "read_file", m))
-
-    for m in re.finditer(r"<search_files(?:\s+path=([\"']?)(.*?)\1)?[^>]*>(.*?)</search_files\s*>", text, re.DOTALL):
-        matches.append((m.start(), "search_files", m))
-
-    for m in re.finditer(r"<write_file\s+path=([\"']?)(.*?)\1[^>]*>(.*?)</write_file\s*>", text, re.DOTALL):
-        matches.append((m.start(), "write_file", m))
-        
-    for m in re.finditer(r"<patch_file\s+path=([\"']?)(.*?)\1[^>]*>\s*<search>(.*?)</search>\s*<replace>(.*?)</replace>\s*</patch_file\s*>", text, re.DOTALL):
-        matches.append((m.start(), "patch_file", m))
-
-    for m in re.finditer(r"<spawn_agent\s+name=([\"']?)(.*?)\1[^>]*>(.*?)</spawn_agent\s*>", text, re.DOTALL):
-        matches.append((m.start(), "spawn_agent", m))
-        
-    for m in re.finditer(r"<delete_file>(.*?)</delete_file\s*>", text, re.DOTALL):
-        matches.append((m.start(), "delete_file", m))
-
-    for m in re.finditer(r"<move_file\s+src=([\"']?)(.*?)\1\s+dst=([\"']?)(.*?)\3\s*/>", text, re.DOTALL):
-        matches.append((m.start(), "move_file", m))
-
-    for m in re.finditer(r"<run_command>(.*?)</run_command\s*>", text, re.DOTALL):
-        matches.append((m.start(), "run_command", m))
-
-    matches.sort(key=lambda x: x[0])
+    for tag_match in _TAG_RE.finditer(text):
+        tag_type = tag_match.group(1)
+        m = _TOOL_PATTERNS[tag_type].match(text, tag_match.start())
+        if m:
+            matches.append((m.start(), tag_type, m))
 
     # Reject any match whose start falls inside an already-consumed span, so a
     # tag literally appearing in another tag's body (e.g. a <read_file> inside
