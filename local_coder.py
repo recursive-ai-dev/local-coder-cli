@@ -364,15 +364,16 @@ def tool_search_files(target_dir: Path, pattern: str, path: str = ".") -> str:
         matches = []
         total_matches = 0
 
-        if safe_path.is_file():
-            files_to_check = [safe_path]
-        else:
-            files_to_check = []
-            for root, _, files in os.walk(safe_path):
-                for f in files:
-                    files_to_check.append(Path(root) / f)
+        def get_files_to_check():
+            if safe_path.is_file():
+                yield safe_path
+            else:
+                for root, _, files in os.walk(safe_path):
+                    root_path = Path(root)
+                    for f in files:
+                        yield root_path / f
 
-        for f_path in files_to_check:
+        for f_path in get_files_to_check():
             try:
                 if f_path.stat().st_size > 500 * 1024:
                     continue
