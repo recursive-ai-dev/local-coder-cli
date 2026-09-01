@@ -611,6 +611,81 @@ class TestLocalCoder(unittest.TestCase):
         finally:
             local_coder._YOLO_MODE = False
 
+    def test_compact_old_tool_results(self):
+        # Empty message list
+        messages = []
+        local_coder.compact_old_tool_results(messages, keep_last=1)
+        self.assertEqual(messages, [])
+
+        # Messages with no tool results
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"}
+        ]
+        local_coder.compact_old_tool_results(messages, keep_last=1)
+        self.assertEqual(messages[0]["content"], "hello")
+        self.assertEqual(messages[1]["content"], "hi")
+
+        # Number of tool blocks equal to keep_last (none compacted)
+        messages = [
+            {"role": "user", "content": "1"},
+            {"role": "tool", "content": "tool 1"},
+            {"role": "assistant", "content": "2"}
+        ]
+        local_coder.compact_old_tool_results(messages, keep_last=1)
+        self.assertEqual(messages[1]["content"], "tool 1")
+
+        # Number of tool blocks greater than keep_last (older compacted)
+        messages = [
+            {"role": "user", "content": "1"},
+            {"role": "tool", "content": "tool 1"},
+            {"role": "assistant", "content": "2"},
+            {"role": "tool", "content": "tool 2"},
+            {"role": "assistant", "content": "3"}
+        ]
+        local_coder.compact_old_tool_results(messages, keep_last=1)
+        self.assertIn("Tool result omitted to save context", messages[1]["content"])
+        self.assertEqual(messages[3]["content"], "tool 2")
+
+        # keep_last=0 (all tool blocks compacted)
+        messages = [
+            {"role": "user", "content": "1"},
+            {"role": "tool", "content": "tool 1"},
+            {"role": "assistant", "content": "2"},
+            {"role": "tool", "content": "tool 2"}
+        ]
+        local_coder.compact_old_tool_results(messages, keep_last=0)
+        self.assertIn("Tool result omitted to save context", messages[1]["content"])
+        self.assertIn("Tool result omitted to save context", messages[3]["content"])
+
+        # Consecutive tool messages group into single block
+        messages = [
+            {"role": "user", "content": "1"},
+            {"role": "tool", "content": "tool 1"},
+            {"role": "tool", "content": "tool 2"},
+            {"role": "assistant", "content": "2"},
+            {"role": "tool", "content": "tool 3"},
+            {"role": "tool", "content": "tool 4"}
+        ]
+        local_coder.compact_old_tool_results(messages, keep_last=1)
+        self.assertIn("Tool result omitted to save context", messages[1]["content"])
+        self.assertIn("Tool result omitted to save context", messages[2]["content"])
+        self.assertEqual(messages[4]["content"], "tool 3")
+        self.assertEqual(messages[5]["content"], "tool 4")
+
+        # Role user with is_tool_result
+        messages = [
+            {"role": "user", "content": "user 1"},
+            {"role": "user", "content": "tool 1", "is_tool_result": True},
+            {"role": "assistant", "content": "ass 1"},
+            {"role": "user", "content": "tool 2", "is_tool_result": True}
+        ]
+        local_coder.compact_old_tool_results(messages, keep_last=1)
+        self.assertEqual(messages[0]["content"], "user 1")
+        self.assertIn("Tool result omitted to save context", messages[1]["content"])
+        self.assertEqual(messages[3]["content"], "tool 2")
+
+
 if __name__ == "__main__":
     unittest.main()
 
