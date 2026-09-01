@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch, MagicMock
 import tempfile
 import shutil
 import time
@@ -57,6 +58,23 @@ class TestLocalCoder(unittest.TestCase):
         # Read file
         read_res = local_coder.tool_read_file(self.test_dir, "test.txt")
         self.assertEqual(read_res, "Hello World")
+
+
+
+    @patch("pathlib.Path.stat")
+    def test_tool_read_file_large(self, mock_stat):
+        # Create a real file so it passes the .exists() and .is_file() checks
+        local_coder.tool_write_file(self.test_dir, "large_file.txt", "small content")
+
+        # Mock the stat result to simulate a large file. Need to mock an object that behaves like os.stat_result.
+        import os
+        mock_stat_result = os.stat_result((33188, 12345, 67890, 1, 1000, 1000, 600 * 1024, 1629837234, 1629837234, 1629837234))
+        mock_stat.return_value = mock_stat_result
+
+        # Read file
+        read_res = local_coder.tool_read_file(self.test_dir, "large_file.txt")
+        self.assertIn("too large to read", read_res)
+        self.assertIn("614400 bytes", read_res)
 
     def test_tool_list_dir(self):
         # Create files & folders
