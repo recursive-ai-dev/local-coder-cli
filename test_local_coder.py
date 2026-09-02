@@ -16,7 +16,6 @@ class TestLocalCoder(unittest.TestCase):
         shutil.rmtree(self.test_dir)
         
     def test_load_agent_config(self):
-        import json
         agents_dir = self.test_dir / ".local-coder" / "agents"
         agents_dir.mkdir(parents=True, exist_ok=True)
         config_data = {
