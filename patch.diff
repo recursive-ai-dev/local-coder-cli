@@ -1,0 +1,16 @@
+--- test_local_coder.py
++++ test_local_coder.py
+@@ -428,7 +428,13 @@
+         data = json.loads(created.read_text())
+         self.assertEqual(data["name"], "Myagent")
+
++    def test_scaffold_create_agent_existing_file(self):
++        a_dir = local_coder.get_agents_dir(self.test_dir)
++        a_dir.mkdir(parents=True, exist_ok=True)
++        dummy_file = a_dir / "myagent.json"
++        dummy_file.write_text("{}")
++
+         with self.assertRaises(SystemExit):
+             local_coder.scaffold_create_agent(self.test_dir, "myagent")
+
+     def test_save_load_session(self):
