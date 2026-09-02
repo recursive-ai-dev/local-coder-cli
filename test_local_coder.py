@@ -772,6 +772,28 @@ class TestLocalCoder(unittest.TestCase):
         finally:
             local_coder._YOLO_MODE = False
 
+
+    def test_build_tool_result_message(self):
+        # Empty list
+        self.assertEqual(local_coder.build_tool_result_message([]), "")
+
+        # Single tool result
+        single = [{"tool": "read_file", "path": "test.txt", "result": "hello world"}]
+        expected_single = "### Execution result of read_file on 'test.txt':\nhello world\n"
+        self.assertEqual(local_coder.build_tool_result_message(single), expected_single)
+
+        # Multiple tool results
+        multiple = [
+            {"tool": "read_file", "path": "test1.txt", "result": "hello 1"},
+            {"tool": "list_dir", "path": ".", "result": "file1\nfile2"}
+        ]
+        expected_multiple = (
+            "### Execution result of read_file on 'test1.txt':\nhello 1\n"
+            "\n"
+            "### Execution result of list_dir on '.':\nfile1\nfile2\n"
+        )
+        self.assertEqual(local_coder.build_tool_result_message(multiple), expected_multiple)
+
 if __name__ == "__main__":
     unittest.main()
 
