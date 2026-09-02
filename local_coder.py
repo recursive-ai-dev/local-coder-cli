@@ -250,7 +250,9 @@ def get_safe_path(target_dir: Path, subpath_str: str) -> Path:
     return resolved
 
 import fnmatch
+import functools
 
+@functools.lru_cache(maxsize=128)
 def _load_gitignore(target_dir: Path) -> list[str]:
     gitignore_path = target_dir / ".gitignore"
     patterns = [".git/"]
@@ -364,15 +366,16 @@ def tool_search_files(target_dir: Path, pattern: str, path: str = ".") -> str:
         matches = []
         total_matches = 0
 
-        if safe_path.is_file():
-            files_to_check = [safe_path]
-        else:
-            files_to_check = []
-            for root, _, files in os.walk(safe_path):
-                for f in files:
-                    files_to_check.append(Path(root) / f)
+        def get_files_to_check():
+            if safe_path.is_file():
+                yield safe_path
+            else:
+                for root, _, files in os.walk(safe_path):
+                    root_path = Path(root)
+                    for f in files:
+                        yield root_path / f
 
-        for f_path in files_to_check:
+        for f_path in get_files_to_check():
             try:
                 if f_path.stat().st_size > 500 * 1024:
                     continue
@@ -679,6 +682,9 @@ def execute_native_tools(target_dir: Path, tool_calls: list[dict], allowed_tools
 
         elif tool_name == "delete_file":
             path = args.get("path", "")
+            if not ask_user_confirmation("delete_file", path, "Delete file"):
+                results.append({"tool": "delete_file", "id": tool_id, "path": path, "result": "Error: User denied permission to delete file."})
+                continue
             res = tool_delete_file(target_dir, path)
             format_and_print_tool_call("delete_file", path, res)
             results.append({"tool": "delete_file", "id": tool_id, "path": path, "result": res})
@@ -686,6 +692,9 @@ def execute_native_tools(target_dir: Path, tool_calls: list[dict], allowed_tools
         elif tool_name == "move_file":
             src = args.get("src", "")
             dst = args.get("dst", "")
+            if not ask_user_confirmation("move_file", f"{src} -> {dst}", f"Move file from {src} to {dst}"):
+                results.append({"tool": "move_file", "id": tool_id, "path": f"{src} -> {dst}", "result": "Error: User denied permission to move file."})
+                continue
             res = tool_move_file(target_dir, src, dst)
             format_and_print_tool_call("move_file", f"src='{src}' dst='{dst}'", res)
             results.append({"tool": "move_file", "id": tool_id, "path": f"{src} -> {dst}", "result": res})
@@ -941,6 +950,9 @@ def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str
             results.append({"tool": "spawn_agent", "path": name, "result": res})
         elif tag_type == "delete_file":
             path = m.group(1).strip()
+            if not ask_user_confirmation("delete_file", path, "Delete file"):
+                results.append({"tool": "delete_file", "path": path, "result": "Error: User denied permission to delete file."})
+                continue
             res = tool_delete_file(target_dir, path)
             format_and_print_tool_call("delete_file", path, res)
             results.append({"tool": "delete_file", "path": path, "result": res})
@@ -948,6 +960,9 @@ def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str
         elif tag_type == "move_file":
             src = m.group(2).strip()
             dst = m.group(4).strip()
+            if not ask_user_confirmation("move_file", f"{src} -> {dst}", f"Move file from {src} to {dst}"):
+                results.append({"tool": "move_file", "path": f"{src} -> {dst}", "result": "Error: User denied permission to move file."})
+                continue
             res = tool_move_file(target_dir, src, dst)
             format_and_print_tool_call("move_file", f"src='{src}' dst='{dst}'", res)
             results.append({"tool": "move_file", "path": f"{src} -> {dst}", "result": res})

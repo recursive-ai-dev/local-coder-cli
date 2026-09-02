@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch, MagicMock
 import tempfile
 import shutil
 import time
@@ -16,7 +17,6 @@ class TestLocalCoder(unittest.TestCase):
         shutil.rmtree(self.test_dir)
         
     def test_load_agent_config(self):
-        import json
         agents_dir = self.test_dir / ".local-coder" / "agents"
         agents_dir.mkdir(parents=True, exist_ok=True)
         config_data = {
@@ -58,6 +58,23 @@ class TestLocalCoder(unittest.TestCase):
         read_res = local_coder.tool_read_file(self.test_dir, "test.txt")
         self.assertEqual(read_res, "Hello World")
 
+
+
+    @patch("pathlib.Path.stat")
+    def test_tool_read_file_large(self, mock_stat):
+        # Create a real file so it passes the .exists() and .is_file() checks
+        local_coder.tool_write_file(self.test_dir, "large_file.txt", "small content")
+
+        # Mock the stat result to simulate a large file. Need to mock an object that behaves like os.stat_result.
+        import os
+        mock_stat_result = os.stat_result((33188, 12345, 67890, 1, 1000, 1000, 600 * 1024, 1629837234, 1629837234, 1629837234))
+        mock_stat.return_value = mock_stat_result
+
+        # Read file
+        read_res = local_coder.tool_read_file(self.test_dir, "large_file.txt")
+        self.assertIn("too large to read", read_res)
+        self.assertIn("614400 bytes", read_res)
+
     def test_tool_list_dir(self):
         # Create files & folders
         local_coder.tool_write_file(self.test_dir, "a.txt", "content")
@@ -95,6 +112,37 @@ class TestLocalCoder(unittest.TestCase):
         local_coder.tool_write_file(self.test_dir, "math_utils_2.py", "def a():\n  pass\n\ndef a():\n  pass")
         patch_res2 = local_coder.tool_patch_file(self.test_dir, "math_utils_2.py", "def a():\n  pass", "def a():\n  return 1")
         self.assertIn("Error: Search block found multiple times", patch_res2)
+
+        # Normalized whitespace patch
+        local_coder.tool_write_file(self.test_dir, "math_utils_3.py", "def c():\r\n  pass\r\n")
+        patch_res3 = local_coder.tool_patch_file(
+            self.test_dir,
+            "math_utils_3.py",
+            "def c():\r\n  pass",
+            "def c():\r\n  return 2"
+        )
+        self.assertIn("Successfully applied patch (normalized whitespace)", patch_res3)
+        patched_content_3 = local_coder.tool_read_file(self.test_dir, "math_utils_3.py")
+        self.assertIn("return 2", patched_content_3)
+
+        # Normalized whitespace multi-match
+        local_coder.tool_write_file(self.test_dir, "math_utils_4.py", "def d():\r\n  pass\r\n\ndef d():\r\n  pass\r\n")
+        patch_res4 = local_coder.tool_patch_file(
+            self.test_dir,
+            "math_utils_4.py",
+            "def d():\r\n  pass",
+            "def d():\r\n  return 3"
+        )
+        self.assertIn("Error: Search block found multiple times", patch_res4)
+
+        # Normalized whitespace exact missing block test
+        patch_res5 = local_coder.tool_patch_file(
+            self.test_dir,
+            "math_utils_4.py",
+            "def d():\r\n  return 3",
+            "def d():\r\n  return 4"
+        )
+        self.assertIn("Error: Could not find exact search block", patch_res5)
 
     def test_tool_delete_file(self):
         # Create a file
@@ -205,6 +253,98 @@ class TestLocalCoder(unittest.TestCase):
         # Verify file WAS created
         file_path = self.test_dir / "good.py"
         self.assertTrue(file_path.exists())
+
+    def test_ask_user_confirmation_delete_deny(self):
+        import textwrap
+        from unittest.mock import patch
+
+        local_coder._YOLO_MODE = False
+        local_coder.TUI_MODE = False
+        local_coder.tool_write_file(self.test_dir, "delete_me.txt", "content")
+
+        llm_response = textwrap.dedent("""\
+            <delete_file>delete_me.txt</delete_file>
+        """)
+
+        with patch("local_coder.Confirm.ask", return_value=False):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "delete_file")
+        self.assertEqual(results[0]["path"], "delete_me.txt")
+        self.assertEqual(results[0]["result"], "Error: User denied permission to delete file.")
+
+        file_path = self.test_dir / "delete_me.txt"
+        self.assertTrue(file_path.exists())
+
+    def test_ask_user_confirmation_delete_allow(self):
+        import textwrap
+        from unittest.mock import patch
+
+        local_coder._YOLO_MODE = False
+        local_coder.TUI_MODE = False
+        local_coder.tool_write_file(self.test_dir, "delete_me.txt", "content")
+
+        llm_response = textwrap.dedent("""\
+            <delete_file>delete_me.txt</delete_file>
+        """)
+
+        with patch("local_coder.Confirm.ask", return_value=True):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "delete_file")
+        self.assertEqual(results[0]["path"], "delete_me.txt")
+        self.assertIn("Successfully deleted", results[0]["result"])
+
+        file_path = self.test_dir / "delete_me.txt"
+        self.assertFalse(file_path.exists())
+
+    def test_ask_user_confirmation_move_deny(self):
+        import textwrap
+        from unittest.mock import patch
+
+        local_coder._YOLO_MODE = False
+        local_coder.TUI_MODE = False
+        local_coder.tool_write_file(self.test_dir, "src.txt", "content")
+
+        llm_response = textwrap.dedent("""\
+            <move_file src="src.txt" dst="dst.txt" />
+        """)
+
+        with patch("local_coder.Confirm.ask", return_value=False):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "move_file")
+        self.assertEqual(results[0]["path"], "src.txt -> dst.txt")
+        self.assertEqual(results[0]["result"], "Error: User denied permission to move file.")
+
+        self.assertTrue((self.test_dir / "src.txt").exists())
+        self.assertFalse((self.test_dir / "dst.txt").exists())
+
+    def test_ask_user_confirmation_move_allow(self):
+        import textwrap
+        from unittest.mock import patch
+
+        local_coder._YOLO_MODE = False
+        local_coder.TUI_MODE = False
+        local_coder.tool_write_file(self.test_dir, "src.txt", "content")
+
+        llm_response = textwrap.dedent("""\
+            <move_file src="src.txt" dst="dst.txt" />
+        """)
+
+        with patch("local_coder.Confirm.ask", return_value=True):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool"], "move_file")
+        self.assertEqual(results[0]["path"], "src.txt -> dst.txt")
+        self.assertIn("Successfully moved", results[0]["result"])
+
+        self.assertFalse((self.test_dir / "src.txt").exists())
+        self.assertTrue((self.test_dir / "dst.txt").exists())
 
     def test_spawn_agent_parsing(self):
         llm_response = """\
@@ -420,6 +560,25 @@ class TestLocalCoder(unittest.TestCase):
         self.assertIn("explorer", agents)
         self.assertIn("reviewer", agents)
 
+    def test_get_all_agents_invalid_json_warning(self):
+        from unittest.mock import patch
+
+        agents_dir = self.test_dir / ".local-coder" / "agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+
+        invalid_json_file = agents_dir / "invalid_agent.json"
+        invalid_json_file.write_text("{ invalid json ", encoding="utf-8")
+
+        with patch('local_coder.console.print') as mock_print:
+            agents = local_coder.get_all_agents(self.test_dir)
+
+            self.assertNotIn("invalid_agent", agents)
+
+            mock_print.assert_called_once()
+            printed_msg = mock_print.call_args[0][0]
+            self.assertIn("Warning: Could not load agent profile from", printed_msg)
+            self.assertIn("invalid_agent.json", printed_msg)
+
     def test_scaffold_create_agent(self):
         local_coder.scaffold_create_agent(self.test_dir, "myagent")
         created = self.test_dir / ".local-coder" / "agents" / "myagent.json"
@@ -571,7 +730,9 @@ class TestLocalCoder(unittest.TestCase):
             <list_dir>.</list_dir>
             <delete_file>2.txt</delete_file>
         """)
-        results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
+        from unittest.mock import patch
+        with patch("local_coder.Confirm.ask", return_value=True):
+            results = local_coder.parse_and_execute_tools(self.test_dir, llm_response)
         self.assertEqual(len(results), 3)
         self.assertEqual(results[0]["tool"], "read_file")
         self.assertEqual(results[1]["tool"], "list_dir")
@@ -685,6 +846,27 @@ class TestLocalCoder(unittest.TestCase):
         self.assertIn("Tool result omitted to save context", messages[1]["content"])
         self.assertEqual(messages[3]["content"], "tool 2")
 
+
+    def test_build_tool_result_message(self):
+        # Empty list
+        self.assertEqual(local_coder.build_tool_result_message([]), "")
+
+        # Single tool result
+        single = [{"tool": "read_file", "path": "test.txt", "result": "hello world"}]
+        expected_single = "### Execution result of read_file on 'test.txt':\nhello world\n"
+        self.assertEqual(local_coder.build_tool_result_message(single), expected_single)
+
+        # Multiple tool results
+        multiple = [
+            {"tool": "read_file", "path": "test1.txt", "result": "hello 1"},
+            {"tool": "list_dir", "path": ".", "result": "file1\nfile2"}
+        ]
+        expected_multiple = (
+            "### Execution result of read_file on 'test1.txt':\nhello 1\n"
+            "\n"
+            "### Execution result of list_dir on '.':\nfile1\nfile2\n"
+        )
+        self.assertEqual(local_coder.build_tool_result_message(multiple), expected_multiple)
 
 if __name__ == "__main__":
     unittest.main()
