@@ -6,6 +6,7 @@ import sys
 import re
 import argparse
 import subprocess
+import shlex
 import atexit
 import socket
 import json
@@ -721,9 +722,15 @@ def tool_run_command(target_dir: Path, command: str) -> str:
         # ask_user_confirmation is the actual gate here, same as write_file
         # and patch_file.
         try:
+
+            try:
+                parsed_command = shlex.split(command)
+            except ValueError as e:
+                return f"Error parsing command: {e}"
+
             result = subprocess.run(
-                command,
-                shell=True,
+                parsed_command,
+                shell=False,
                 cwd=str(target_dir),
                 capture_output=True,
                 text=True,
