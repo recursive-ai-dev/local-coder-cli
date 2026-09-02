@@ -250,7 +250,9 @@ def get_safe_path(target_dir: Path, subpath_str: str) -> Path:
     return resolved
 
 import fnmatch
+import functools
 
+@functools.lru_cache(maxsize=128)
 def _load_gitignore(target_dir: Path) -> list[str]:
     gitignore_path = target_dir / ".gitignore"
     patterns = [".git/"]
