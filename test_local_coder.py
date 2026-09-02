@@ -113,6 +113,37 @@ class TestLocalCoder(unittest.TestCase):
         patch_res2 = local_coder.tool_patch_file(self.test_dir, "math_utils_2.py", "def a():\n  pass", "def a():\n  return 1")
         self.assertIn("Error: Search block found multiple times", patch_res2)
 
+        # Normalized whitespace patch
+        local_coder.tool_write_file(self.test_dir, "math_utils_3.py", "def c():\r\n  pass\r\n")
+        patch_res3 = local_coder.tool_patch_file(
+            self.test_dir,
+            "math_utils_3.py",
+            "def c():\r\n  pass",
+            "def c():\r\n  return 2"
+        )
+        self.assertIn("Successfully applied patch (normalized whitespace)", patch_res3)
+        patched_content_3 = local_coder.tool_read_file(self.test_dir, "math_utils_3.py")
+        self.assertIn("return 2", patched_content_3)
+
+        # Normalized whitespace multi-match
+        local_coder.tool_write_file(self.test_dir, "math_utils_4.py", "def d():\r\n  pass\r\n\ndef d():\r\n  pass\r\n")
+        patch_res4 = local_coder.tool_patch_file(
+            self.test_dir,
+            "math_utils_4.py",
+            "def d():\r\n  pass",
+            "def d():\r\n  return 3"
+        )
+        self.assertIn("Error: Search block found multiple times", patch_res4)
+
+        # Normalized whitespace exact missing block test
+        patch_res5 = local_coder.tool_patch_file(
+            self.test_dir,
+            "math_utils_4.py",
+            "def d():\r\n  return 3",
+            "def d():\r\n  return 4"
+        )
+        self.assertIn("Error: Could not find exact search block", patch_res5)
+
     def test_tool_delete_file(self):
         # Create a file
         local_coder.tool_write_file(self.test_dir, "delete_me.txt", "content")
