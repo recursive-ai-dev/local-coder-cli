@@ -682,6 +682,9 @@ def execute_native_tools(target_dir: Path, tool_calls: list[dict], allowed_tools
 
         elif tool_name == "delete_file":
             path = args.get("path", "")
+            if not ask_user_confirmation("delete_file", path, "Delete file"):
+                results.append({"tool": "delete_file", "id": tool_id, "path": path, "result": "Error: User denied permission to delete file."})
+                continue
             res = tool_delete_file(target_dir, path)
             format_and_print_tool_call("delete_file", path, res)
             results.append({"tool": "delete_file", "id": tool_id, "path": path, "result": res})
@@ -689,6 +692,9 @@ def execute_native_tools(target_dir: Path, tool_calls: list[dict], allowed_tools
         elif tool_name == "move_file":
             src = args.get("src", "")
             dst = args.get("dst", "")
+            if not ask_user_confirmation("move_file", f"{src} -> {dst}", f"Move file from {src} to {dst}"):
+                results.append({"tool": "move_file", "id": tool_id, "path": f"{src} -> {dst}", "result": "Error: User denied permission to move file."})
+                continue
             res = tool_move_file(target_dir, src, dst)
             format_and_print_tool_call("move_file", f"src='{src}' dst='{dst}'", res)
             results.append({"tool": "move_file", "id": tool_id, "path": f"{src} -> {dst}", "result": res})
@@ -944,6 +950,9 @@ def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str
             results.append({"tool": "spawn_agent", "path": name, "result": res})
         elif tag_type == "delete_file":
             path = m.group(1).strip()
+            if not ask_user_confirmation("delete_file", path, "Delete file"):
+                results.append({"tool": "delete_file", "path": path, "result": "Error: User denied permission to delete file."})
+                continue
             res = tool_delete_file(target_dir, path)
             format_and_print_tool_call("delete_file", path, res)
             results.append({"tool": "delete_file", "path": path, "result": res})
@@ -951,6 +960,9 @@ def parse_and_execute_tools(target_dir: Path, text: str, allowed_tools: list[str
         elif tag_type == "move_file":
             src = m.group(2).strip()
             dst = m.group(4).strip()
+            if not ask_user_confirmation("move_file", f"{src} -> {dst}", f"Move file from {src} to {dst}"):
+                results.append({"tool": "move_file", "path": f"{src} -> {dst}", "result": "Error: User denied permission to move file."})
+                continue
             res = tool_move_file(target_dir, src, dst)
             format_and_print_tool_call("move_file", f"src='{src}' dst='{dst}'", res)
             results.append({"tool": "move_file", "path": f"{src} -> {dst}", "result": res})
