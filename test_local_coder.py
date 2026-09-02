@@ -560,6 +560,25 @@ class TestLocalCoder(unittest.TestCase):
         self.assertIn("explorer", agents)
         self.assertIn("reviewer", agents)
 
+    def test_get_all_agents_invalid_json_warning(self):
+        from unittest.mock import patch
+
+        agents_dir = self.test_dir / ".local-coder" / "agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+
+        invalid_json_file = agents_dir / "invalid_agent.json"
+        invalid_json_file.write_text("{ invalid json ", encoding="utf-8")
+
+        with patch('local_coder.console.print') as mock_print:
+            agents = local_coder.get_all_agents(self.test_dir)
+
+            self.assertNotIn("invalid_agent", agents)
+
+            mock_print.assert_called_once()
+            printed_msg = mock_print.call_args[0][0]
+            self.assertIn("Warning: Could not load agent profile from", printed_msg)
+            self.assertIn("invalid_agent.json", printed_msg)
+
     def test_scaffold_create_agent(self):
         local_coder.scaffold_create_agent(self.test_dir, "myagent")
         created = self.test_dir / ".local-coder" / "agents" / "myagent.json"
