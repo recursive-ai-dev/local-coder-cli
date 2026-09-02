@@ -90,6 +90,18 @@ class TestLocalCoder(unittest.TestCase):
         list_sub_res = local_coder.tool_list_dir(self.test_dir, "sub")
         self.assertIn("[FILE] sub/b.txt", list_sub_res)
 
+
+    def test_tool_list_dir_large_directory(self):
+        # Create 205 files
+        for i in range(205):
+            local_coder.tool_write_file(self.test_dir, f"file_{i}.txt", "content")
+
+        list_res = local_coder.tool_list_dir(self.test_dir, ".")
+        lines = list_res.split("\n")
+
+        self.assertEqual(len(lines), 201)
+        self.assertEqual(lines[-1], "... [5 more items hidden]")
+
     def test_tool_patch_file(self):
         content = "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b"
         local_coder.tool_write_file(self.test_dir, "math_utils.py", content)
