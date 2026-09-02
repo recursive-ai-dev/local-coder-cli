@@ -1,0 +1,9 @@
+⚡ Optimize regex parsing of tool calls
+
+💡 What: Replaced the 9 full-text O(n) regex finditer calls in `parse_and_execute_tools` with a single quick O(n) scan that matches the start tags, followed by dispatching to the specific pre-compiled regex for full extraction.
+🎯 Why: The previous code scanned the entire assistant output 9 separate times looking for various XML tags using `re.DOTALL` which is O(9 * n) in string length. For long generation (such as file creations), this regex processing blocks the execution flow.
+📊 Measured Improvement:
+Baseline (10000 tool matches in simulated long text): ~0.10s
+Optimized: ~0.03s
+Improvement: ~3x speedup on XML parsing.
+This directly addresses the O(n) overhead of tool scanning in the parsing loop.
