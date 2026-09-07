@@ -1,0 +1,22 @@
+$ ruff check --output-format=concise /app
+local_coder.py:24:25: F401 [*] `rich.prompt.Prompt` imported but unused
+local_coder.py:253:1: E402 Module level import not at top of file
+local_coder.py:254:1: E402 Module level import not at top of file
+local_coder.py:785:16: E701 Multiple statements on one line (colon)
+local_coder.py:790:29: F541 [*] f-string without any placeholders
+local_coder.py:805:41: E701 Multiple statements on one line (colon)
+local_coder.py:806:39: E701 Multiple statements on one line (colon)
+local_coder.py:807:41: E701 Multiple statements on one line (colon)
+local_coder.py:808:40: E701 Multiple statements on one line (colon)
+local_coder.py:809:39: E701 Multiple statements on one line (colon)
+local_coder.py:1114:16: F541 [*] f-string without any placeholders
+local_coder.py:1127:5: E731 Do not assign a `lambda` expression, use a `def`
+local_coder.py:1228:5: E731 Do not assign a `lambda` expression, use a `def`
+local_coder.py:1272:27: F541 [*] f-string without any placeholders
+local_coder.py:1282:19: F541 [*] f-string without any placeholders
+local_coder.py:1820:9: E731 Do not assign a `lambda` expression, use a `def`
+test_local_coder.py:2:34: F401 [*] `unittest.mock.MagicMock` imported but unused
+test_local_coder.py:472:35: F811 [*] Redefinition of unused `MagicMock` from line 2: `MagicMock` redefined here
+Found 18 errors.
+[*] 7 fixable with the `--fix` option (3 hidden fixes can be enabled with the `--unsafe-fixes` option).
+[exit 1]

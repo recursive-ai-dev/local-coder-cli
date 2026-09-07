@@ -1,0 +1,41 @@
+$ mypy --no-error-summary /app
+local_coder.py:16: error: Cannot find implementation or library stub for module named "httpx"  [import-not-found]
+local_coder.py:17: error: Cannot find implementation or library stub for module named "openai"  [import-not-found]
+local_coder.py:18: error: Cannot find implementation or library stub for module named "rich.console"  [import-not-found]
+local_coder.py:18: note: See https://mypy.readthedocs.io/en/stable/running_mypy.html#missing-imports
+local_coder.py:19: error: Cannot find implementation or library stub for module named "rich.panel"  [import-not-found]
+local_coder.py:20: error: Cannot find implementation or library stub for module named "rich.syntax"  [import-not-found]
+local_coder.py:21: error: Cannot find implementation or library stub for module named "rich.live"  [import-not-found]
+local_coder.py:22: error: Cannot find implementation or library stub for module named "rich.table"  [import-not-found]
+local_coder.py:23: error: Cannot find implementation or library stub for module named "rich.markdown"  [import-not-found]
+local_coder.py:24: error: Cannot find implementation or library stub for module named "rich.prompt"  [import-not-found]
+local_coder.py:25: error: Cannot find implementation or library stub for module named "rich.align"  [import-not-found]
+local_coder.py:27: error: Cannot find implementation or library stub for module named "textual.app"  [import-not-found]
+local_coder.py:28: error: Cannot find implementation or library stub for module named "textual.containers"  [import-not-found]
+local_coder.py:29: error: Cannot find implementation or library stub for module named "textual.widgets"  [import-not-found]
+local_coder.py:30: error: Cannot find implementation or library stub for module named "textual.screen"  [import-not-found]
+local_coder.py:31: error: Cannot find implementation or library stub for module named "textual"  [import-not-found]
+local_coder.py:620: error: Incompatible default for argument "allowed_tools" (default has type "None", argument has type "list[str]")  [assignment]
+local_coder.py:620: note: PEP 484 prohibits implicit Optional. Accordingly, mypy has changed its default to no_implicit_optional=True
+local_coder.py:620: note: Use https://github.com/hauntsaninja/no_implicit_optional to automatically upgrade your codebase
+local_coder.py:843: error: "None" has no attribute "call_from_thread"  [attr-defined]
+local_coder.py:843: error: "None" has no attribute "push_screen"  [attr-defined]
+local_coder.py:861: error: Incompatible default for argument "allowed_tools" (default has type "None", argument has type "list[str]")  [assignment]
+local_coder.py:861: note: PEP 484 prohibits implicit Optional. Accordingly, mypy has changed its default to no_implicit_optional=True
+local_coder.py:861: note: Use https://github.com/hauntsaninja/no_implicit_optional to automatically upgrade your codebase
+local_coder.py:1026: error: Incompatible default for argument "tool_calls" (default has type "None", argument has type "list[Any]")  [assignment]
+local_coder.py:1026: note: PEP 484 prohibits implicit Optional. Accordingly, mypy has changed its default to no_implicit_optional=True
+local_coder.py:1026: note: Use https://github.com/hauntsaninja/no_implicit_optional to automatically upgrade your codebase
+local_coder.py:1090: error: Unsupported target for indexed assignment ("dict[str, Any | str] | Any | str")  [index]
+local_coder.py:1090: error: Invalid index type "str" for "str"; expected type "SupportsIndex | slice[Any, Any, Any]"  [index]
+local_coder.py:1092: error: Unsupported target for indexed assignment ("dict[str, Any | str] | Any | str")  [index]
+local_coder.py:1092: error: Invalid index type "str" for "str"; expected type "SupportsIndex | slice[Any, Any, Any]"  [index]
+local_coder.py:1174: error: Argument "allowed_tools" to "parse_and_execute_tools" has incompatible type "Any | None"; expected "list[str]"  [arg-type]
+local_coder.py:1256: error: Incompatible types in assignment (expression has type "list[Any]", target has type "str")  [assignment]
+local_coder.py:1258: error: Argument 1 to "save_session" has incompatible type "None"; expected "Path"  [arg-type]
+local_coder.py:1261: error: Argument "allowed_tools" to "execute_native_tools" has incompatible type "None"; expected "list[str]"  [arg-type]
+local_coder.py:1265: error: Argument "allowed_tools" to "parse_and_execute_tools" has incompatible type "None"; expected "list[str]"  [arg-type]
+local_coder.py:1277: error: Argument 1 to "save_session" has incompatible type "None"; expected "Path"  [arg-type]
+local_coder.py:1289: error: Argument 1 to "save_session" has incompatible type "None"; expected "Path"  [arg-type]
+local_coder.py:1440: error: "Collection[str]" has no attribute "keys"  [attr-defined]
+[exit 1]
